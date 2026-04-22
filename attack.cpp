@@ -99,7 +99,7 @@ void parse_mac(const char *str, uint8_t *mac) {
 // "aa:bb:cc:dd:ee:ff" 형식이 맞는지 확인
 int validate_mac(const char *str) {
     int i;
-    // 길이 체크 (17글자여야 함)
+    // 길이 체크 (17글자여야 함) 왜냐면 뒤에 줄바꿈 있으니까
     if (strlen(str) < 17) return 0;
 
     // 형식 체크: 숫자/알파벳 2개 + 콜론 반복
