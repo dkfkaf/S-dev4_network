@@ -10,21 +10,21 @@
 #define IPPROTO_TCP_VAL 6 //우리는 tcp 쓸거니까 사전에 6으로 정의
 
 struct libnet_ethernet_hdr {
-    uint8_t  ether_dhost[6]; /* destination ethernet address */
-    uint8_t  ether_shost[6]; /* source ethernet address      */
-    uint16_t ether_type;     /* protocol                     */
+    uint8_t  ether_dhost[6]; 
+    uint8_t  ether_shost[6]; 
+    uint16_t ether_type;     /* 쓸 상위 프로토콜                   */
 } __attribute__((packed));
 
 
 struct libnet_ipv4_hdr {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
-    uint8_t ip_hl:4;  /* header length (in 32-bit words) */
-    uint8_t ip_v:4;   /* version                         */
+    uint8_t ip_hl:4;  
+    uint8_t ip_v:4;   
 #else
     uint8_t ip_v:4;
     uint8_t ip_hl:4;
 #endif
-    uint8_t  ip_tos;        /* type of service      */
+    uint8_t  ip_tos;        
     uint16_t ip_len;        /* IP헤더 + 데이터 전체 길이         */
     uint16_t ip_id;         /* 단편화 식별자      */
     uint16_t ip_off;        /* 단편화 플래그 + 오프셋      */
@@ -56,7 +56,7 @@ struct libnet_tcp_hdr {
 
 
 /* ============================================================
- *  Packet Handler
+ *  패킷 핸들러 부분
  * ============================================================ */
 void packet_handler(u_char *,
                     const struct pcap_pkthdr *pkthdr,
