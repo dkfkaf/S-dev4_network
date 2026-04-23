@@ -1,9 +1,9 @@
-CC      = gcc
+CC      = g++        # gcc → g++ (C++ 파일이므로)
 CFLAGS  = -Wall -Wextra -O2
 LDFLAGS = -lpcap
 
-TARGET  = pcap-test
-SRC     = pcap-test.c
+TARGET  = pcaptest
+SRC     = pcap.cpp
 
 all: $(TARGET)
 
