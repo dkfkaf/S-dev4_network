@@ -12,7 +12,7 @@
 struct libnet_ethernet_hdr {
     uint8_t  ether_dhost[6]; 
     uint8_t  ether_shost[6]; 
-    uint16_t ether_type;     /* 쓸 상위 프로토콜                   */
+    uint16_t ether_type;     /* 쓸 상위 프로토콜                 */
 } __attribute__((packed));
 
 
