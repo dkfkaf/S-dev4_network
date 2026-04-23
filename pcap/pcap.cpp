@@ -24,7 +24,7 @@ struct libnet_ipv4_hdr {
     uint8_t ip_v:4;
     uint8_t ip_hl:4;
 #endif
-    uint8_t  ip_tos;        /* type of service      */
+    uint8_t  ip_tos;       
     uint16_t ip_len;        /* IP헤더 + 데이터 전체 길이         */
     uint16_t ip_id;         /* 단편화 식별자      */
     uint16_t ip_off;        /* 단편화 플래그 + 오프셋      */
