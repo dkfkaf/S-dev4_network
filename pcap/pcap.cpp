@@ -10,9 +10,9 @@
 #define IPPROTO_TCP_VAL 6 //우리는 tcp 쓸거니까 사전에 6으로 정의
 
 struct libnet_ethernet_hdr {
-    uint8_t  ether_dhost[6]; /* destination ethernet address */
-    uint8_t  ether_shost[6]; /* source ethernet address      */
-    uint16_t ether_type;     /* protocol                     */
+    uint8_t  ether_dhost[6];
+    uint8_t  ether_shost[6]; 
+    uint16_t ether_type;     /* 우리가 쓸 상위 프로토콜      */
 } __attribute__((packed));
 
 
@@ -56,7 +56,7 @@ struct libnet_tcp_hdr {
 
 
 /* ============================================================
- *  Packet Handler
+ *  패킷 핸들러 함수
  * ============================================================ */
 void packet_handler(u_char *,
                     const struct pcap_pkthdr *pkthdr,
