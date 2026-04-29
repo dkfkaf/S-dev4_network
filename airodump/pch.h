@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <csignal>
 
 // ── C++ 표준 ──
 #include <string>

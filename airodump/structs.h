@@ -51,7 +51,15 @@ struct BeaconFixed {   /*AP가 자기 존재를 알리려고 주기적으로 뿌
 
 // AP 정보 (출력용)
 struct APInfo {
-    std::string bssid; // AP의 MAC 주소
-    std::string essid; // AP의 이름
-    int beacons = 0;  // 비콘 프레임 수신 횟수
+    std::string bssid;  // AP의 MAC 주소
+    std::string essid;  // AP의 이름
+    int  beacons = 0;   // 비콘 프레임 수신 횟수
+    int8_t pwr   = 0;   // 신호 세기 (dBm), 0이면 아직 못 받은 것
+};
+
+// Station 정보 (출력용)
+struct StaInfo {
+    std::string station; // Station(클라이언트)의 MAC 주소
+    std::string bssid;   // 연결된 AP의 BSSID ("(not associated)" 이면 미연결)
+    int packets = 0;     // 수신 패킷 수
 };

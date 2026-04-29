@@ -3,10 +3,21 @@
 #include "parser.h"
 
 // 전역 변수 정의
-std::map<std::string, APInfo> g_aps;
-std::mutex                    g_mtx; /*pcap handler랑 pcap print가 동시에 접근하면 충돌이 나기 때무*/
+std::map<std::string, APInfo>  g_aps;
+std::map<std::string, StaInfo> g_stas; // Station 목록 (bssid가 키)
+std::mutex                     g_mtx; /*pcap handler랑 pcap print가 동시에 접근하면 충돌이 나기 때무*/
 std::atomic<bool>             g_running(true); /*원자성을 보장하는거임, 스레드 충돌을 방지하기 위해!<- 근데 운영체제 벌써
 가물가물하다 어캄..?*/
+pcap_t* g_pcap = nullptr; 
+
+
+
+//ctrl+c오면 작동하는 함수
+void sig_handler(int) {
+    g_running.store(false);    // print_loop 스레드한테 "그만해!" 신호
+    if (g_pcap) 
+        pcap_breakloop(g_pcap); // pcap_loop한테 "루프 탈출해!" 신호
+}
 
 // 1초마다 화면 출력
 
@@ -25,14 +36,30 @@ static void print_loop() {
     while (g_running.load()) {
         {
             std::lock_guard<std::mutex> lk(g_mtx);
+            printf("\033[H\033[J");  // 커서 홈으로 + 화면 지우기
             printf(" S-dev airodump\n\n");
-            printf(" %-17s  %8s  %s\n",
-                   "BSSID", "Beacons", "ESSID");
+            printf(" %-17s  %4s  %8s  %s\n",
+                   "BSSID", "PWR", "Beacons", "ESSID");
             printf(" -------------------------------------------------\n");
             for (auto& kv : g_aps) { //g_aps 처음부터 끝까지 순회
                 const APInfo& a = kv.second;
-                printf(" %-17s  %8d  %s\n",
-                       a.bssid.c_str(), a.beacons, a.essid.c_str());
+                // pwr이 0이면 아직 못 받은 것 → "--" 표시
+                if (a.pwr != 0)
+                    printf(" %-17s  %4d  %8d  %s\n",
+                           a.bssid.c_str(), (int)a.pwr, a.beacons, a.essid.c_str());
+                else
+                    printf(" %-17s  %4s  %8d  %s\n",
+                           a.bssid.c_str(), "--", a.beacons, a.essid.c_str());
+            }
+
+            // Station 섹션 출력
+            printf("\n");
+            printf(" %-17s  %-17s  %8s\n", "Station MAC", "BSSID", "Packets");
+            printf(" -------------------------------------------------\n");
+            for (auto& kv : g_stas) { // g_stas 처음부터 끝까지 순회
+                const StaInfo& s = kv.second;
+                printf(" %-17s  %-17s  %8d\n",
+                       s.station.c_str(), s.bssid.c_str(), s.packets);
             }
         }
         sleep(1);
@@ -42,15 +69,6 @@ static void print_loop() {
 }
 
 
-int main(int argc, char* argv[]) {
-    const char* dev = argv[1]; /*인터페이스가 들어가는 자리*/
-
-     if (argc != 2) {
-        fprintf(stderr, "syntax : airodump <interface>\n");
-        fprintf(stderr, "sample : airodump mon0\n");
-        return EXIT_FAILURE;
-    }
-
     /*pcap_open_live(
     dev,      // 1. 캡처할 네트워크 인터페이스 이름 (예: "eth0", "wlan0")
     BUFSIZ,   // 2. 캡처할 패킷의 최대 바이트 수 (스냅샷 길이), 보통 65535
@@ -59,12 +77,28 @@ int main(int argc, char* argv[]) {
     errbuf    // 5. 오류 발생 시 메시지를 저장할 버퍼 (PCAP_ERRBUF_SIZE 크기)
 );*/
 
+
+
+int main(int argc, char* argv[]) {
+
+
+     if (argc != 2) {
+        fprintf(stderr, "syntax : airodump <interface>\n");
+        fprintf(stderr, "sample : airodump mon0\n");
+        return EXIT_FAILURE;
+    }
+    
+    signal(SIGINT, sig_handler);  // ← "Ctrl+C 오면 sig_handler 불러줘" 등록
+
+    const char* dev = argv[1]; /*인터페이스가 들어가는 자리*/
+
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* pcap = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
     if (!pcap) {
         fprintf(stderr, "pcap_open_live(%s) failed: %s\n", dev, errbuf);
         return 1;
     }
+    g_pcap = pcap;  // 전역 변수에 저장
 
 
     /*pcap_datalink(
@@ -91,6 +125,8 @@ int main(int argc, char* argv[]) {
     packet_handler,  // 패킷이 잡힐 때마다 호출할 콜백 함수
     nullptr          // 콜백 함수에 전달할 추가 데이터 (없으면 nullptr)
 );*/
+
+
     pcap_loop(pcap, 0, packet_handler, nullptr);
 
     g_running.store(false); // 전역 atomic 변수를 false로 설정 (스레드 종료 신호) == 모든 스레드 멈춰!임
