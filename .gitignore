@@ -1,0 +1,8 @@
+pcap/
+wireless/
+attack/
+pcapvoid/
+sum_nbo/
+*.png
+*.jpg
+*.jpeg
