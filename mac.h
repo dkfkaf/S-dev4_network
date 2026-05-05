@@ -5,7 +5,6 @@
 #include <string>
 #include <stdexcept>
 
-// Mac 구조체 
 /*객체가 만들어질때 자동으로 생성되는 생성자(함수)암*/
 struct Mac {
     uint8_t mac_[6]; // MAC 주소를 담는 1바이트(uint8_t) 배열 6개 = 총 6바이트
@@ -19,7 +18,8 @@ struct Mac {
     Mac() { std::memset(mac_, 0, 6); }
 
     // 문자열("AA:BB:CC:DD:EE:FF")을 받아서 Mac 객체를 만드는 생성자
-    Mac(const std::string& s) {  // s : 복사 없이 원본 문자열을 받음, 수정 안 함
+    // explicit: 암묵적 변환 방지 (예: Mac m = "AA:BB..." 같은 실수 차단)
+    explicit Mac(const std::string& s) {  // s : 복사 없이 원본 문자열을 받음, 수정 안 함
         *this = fromString(s);   // fromString()으로 문자열을 Mac으로 변환한 뒤,
                                  // *this(내 자신)에 대입
     }
@@ -47,12 +47,12 @@ struct Mac {
 
     // fromString(): "AA:BB:CC:DD:EE:FF" 형식 문자열을 Mac 객체로 변환
     static Mac fromString(const std::string& s) {
-        unsigned int v[6] = {0}; // 파싱된 6개의 숫자를 임시 저장 (int 크기로 받아서 범위 검증)
-        char extra = 0;          // 파싱 후 남는 문자가 있는지 확인용
+        unsigned int v[6]; // 파싱된 6개의 숫자를 임시 저장 (int 크기로 받아서 범위 검증)
+        char extra;              // 파싱 후 남는 문자가 있는지 확인용
         // sscanf: 문자열에서 형식에 맞게 값을 읽음
         // "%x:%x:..." : 16진수 숫자 6개를 콜론 구분으로 읽음
         // 마지막 %c : 뒤에 남는 문자가 있으면 extra에 저장 (검증용)
-        int n = std::sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x%c",
+        int n = std::sscanf(s.data(), "%x:%x:%x:%x:%x:%x%c",
                             &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &extra);
         // n == 6 이면 정상 파싱, 7이거나 6 미만이면 형식 오류
         if (n != 6) {
