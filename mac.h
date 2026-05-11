@@ -9,7 +9,10 @@ struct Mac {
     uint8_t mac_[6];
 
     Mac() { std::memset(mac_, 0, 6); }
-
+    /*문자열을 받아서 Mac 객체로 만드는 생성자
+    explicit로
+    Mac m = "aa:bb:cc:dd:ee:ff";  // ❌ 컴파일 에러
+    Mac m("aa:bb:cc:dd:ee:ff");   // ✅ 명시적으로만 가능*/
     explicit Mac(const std::string& s) {
         unsigned int v[6];
         char extra;
