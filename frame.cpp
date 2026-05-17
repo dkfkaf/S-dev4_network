@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "frame.h"
 #include "dot11.h"
+#include "tag.h"
 
 static constexpr size_t BEACON_FIXED_LEN = sizeof(Dot11) + sizeof(Beacon);
 
@@ -58,7 +59,7 @@ std::vector<uint8_t> build_csa_beacon(
     }
 
     // 기존 태그 정렬을 유지하며 CSA/ECSA 삽입
-    insert_tag(out, dot11Start + BEACON_FIXED_LEN, layout.tagsLen,
+    insert_tag_in_capture(out, dot11Start + BEACON_FIXED_LEN, layout.tagsLen,
                        Beacon::CsaTag{}, Beacon::EcsaTag{});
     return out;
 }
