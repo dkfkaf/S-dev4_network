@@ -1,13 +1,11 @@
 #pragma once
 #include <cstdint>
-#include <cstddef>
+#include <vector>
 #include "mac.h"
 
-size_t build_csa_beacon(
-    uint8_t*       out_Buf,
-    size_t         in_BufSize,
-    const uint8_t* in_captured,
-    size_t         in_capturedLen,
-    bool           in_useUnicast,
-    const Mac&     in_staMac
+// 성공 시 완성된 CSA beacon 프레임을 반환한다. 실패 시 빈 vector.
+std::vector<uint8_t> build_csa_beacon(
+    const std::vector<uint8_t>& captured,
+    bool                        useUnicast,
+    const Mac&                  staMac
 );

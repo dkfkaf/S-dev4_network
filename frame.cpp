@@ -1,57 +1,64 @@
+#include "pch.h"
 #include "frame.h"
 #include "dot11.h"
-#include <cstring>
 
-static size_t append_tag(
-    uint8_t*       dotframe,
-    size_t         dotframeSize,
-    size_t         dotnew_frame_end,
-    const uint8_t* newTag,
-    size_t         newTagSize)
-{
-    if (dotnew_frame_end + newTagSize > dotframeSize) return 0;
-    std::memcpy(dotframe + dotnew_frame_end, newTag, newTagSize);
-    return dotnew_frame_end + newTagSize;
+static constexpr size_t BEACON_FIXED_LEN = sizeof(Dot11) + sizeof(Beacon);
+
+struct BeaconLayout {
+    size_t rtLen;
+    size_t dot11End;
+    size_t tagsLen;
+};
+
+static bool check_layout(const std::vector<uint8_t>& cap, BeaconLayout& layout) {
+    if (cap.size() < sizeof(Dot11RadioTap)) return false;
+
+    Dot11RadioTap rt; std::memcpy(&rt, cap.data(), sizeof(rt));
+
+    layout.rtLen = rt.len();
+    if (layout.rtLen < sizeof(Dot11RadioTap) || layout.rtLen > cap.size()) return false;
+
+    layout.dot11End = rt.hasFCS_dataEnd(cap.data(), cap.size());
+    if (layout.dot11End < layout.rtLen + BEACON_FIXED_LEN) return false;
+
+    layout.tagsLen = layout.dot11End - layout.rtLen - BEACON_FIXED_LEN;
+    return true;
 }
 
-size_t build_csa_beacon(
-    uint8_t*       out_Buf,
-    size_t         in_BufSize,
-    const uint8_t* in_captured,
-    size_t         in_capturedLen,
-    bool           in_useUnicast,
-    const Mac&     in_staMac)
+// 캡처한 Beacon을 기반으로 CSA/ECSA 태그를 삽입한 송신용 프레임을 반환한다.
+// useUnicast=true이면 addr1을 staMac으로 교체해 유니캐스트로 송신한다.
+std::vector<uint8_t> build_csa_beacon(
+    const std::vector<uint8_t>& captured,
+    bool                        useUnicast,
+    const Mac&                  staMac)
 {
-    if (in_capturedLen < sizeof(Dot11RadioTap)) return 0;
+    BeaconLayout layout;
+    if (!check_layout(captured, layout)) return {};
 
-    const Dot11RadioTap* rtHdr = reinterpret_cast<const Dot11RadioTap*>(in_captured);
-    size_t rtLen = rtHdr->len();
-    if (rtLen < sizeof(Dot11RadioTap) || rtLen > in_capturedLen) return 0;
+    const uint8_t* dot11Start = captured.data() + layout.rtLen;
 
-    size_t dot11End = rtHdr->hasFCS_dataEnd(in_capturedLen);
-    if (dot11End < rtLen + sizeof(Dot11) + sizeof(Beacon)) return 0;
-    size_t dot11Len = dot11End - rtLen;
+    // 원본 CSA/ECSA는 제거 후 항상 새 태그 두 개로 교체되므로 둘 다 확보
+    const size_t csaTagsSize = sizeof(Beacon::CsaTag) + sizeof(Beacon::EcsaTag);
 
-    if (in_BufSize < sizeof(Dot11RadioTap) + dot11Len) return 0;
+    std::vector<uint8_t> out;
+    out.reserve(sizeof(Dot11RadioTap) + (layout.dot11End - layout.rtLen) + csaTagsSize);  // 메모리만 미리 확보 (size는 0 유지)
 
-    *reinterpret_cast<Dot11RadioTap*>(out_Buf) = Dot11RadioTap{};
-    std::memcpy(out_Buf + sizeof(Dot11RadioTap), in_captured + rtLen, dot11Len);
+    // 새 Radiotap 헤더 + 원본 Dot11/Beacon 고정 파라미터 복사
+    const Dot11RadioTap txRt{};
+    out.resize(sizeof(txRt));  // size를 8로 늘리고 0으로 초기화
+    std::memcpy(out.data(), &txRt, sizeof(txRt));  // 그 자리에 실제 값 덮어씀
+    out.insert(out.end(), dot11Start, dot11Start + BEACON_FIXED_LEN);
 
-    if (in_useUnicast) {
-        reinterpret_cast<Dot11*>(out_Buf + sizeof(Dot11RadioTap))->setDst(in_staMac);
+    // 유니캐스트 시 수신 MAC(addr1)을 STA 주소로 교체
+    if (useUnicast) {
+        Dot11 dot11hdr;
+        std::memcpy(&dot11hdr, out.data() + sizeof(Dot11RadioTap), sizeof(Dot11));
+        dot11hdr.setDst(staMac);
+        std::memcpy(out.data() + sizeof(Dot11RadioTap), &dot11hdr, sizeof(Dot11));
     }
 
-    size_t new_frame_end = sizeof(Dot11RadioTap) + dot11Len;
-
-    Beacon::CsaTag csa;
-    new_frame_end = append_tag(out_Buf, in_BufSize, new_frame_end,
-                               reinterpret_cast<const uint8_t*>(&csa), sizeof(csa));
-    if (new_frame_end == 0) return 0;
-
-    Beacon::EcsaTag ecsa;
-    new_frame_end = append_tag(out_Buf, in_BufSize, new_frame_end,
-                               reinterpret_cast<const uint8_t*>(&ecsa), sizeof(ecsa));
-    if (new_frame_end == 0) return 0;
-
-    return new_frame_end;
+    // 기존 태그 정렬을 유지하며 CSA/ECSA 삽입
+    insert_tags_sorted(out, dot11Start + BEACON_FIXED_LEN, layout.tagsLen,
+                       Beacon::CsaTag{}, Beacon::EcsaTag{});
+    return out;
 }

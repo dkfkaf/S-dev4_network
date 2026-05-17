@@ -1,11 +1,11 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 
 project(csa-attack
     VERSION  1.0
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -34,9 +34,11 @@ message(STATUS "PCAP include : ${PCAP_INCLUDE_DIR}")
 message(STATUS "PCAP library : ${PCAP_LIBRARY}")
 
 add_executable(csa-attack
-    main.cpp
+    csa.cpp
     frame.cpp
 )
+
+target_precompile_headers(csa-attack PRIVATE pch.h)
 
 target_include_directories(csa-attack PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
