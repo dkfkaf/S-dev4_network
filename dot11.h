@@ -94,8 +94,6 @@ struct Beacon {
     uint16_t beaconInterval;
     uint16_t capabilityInfo;
 
-    static constexpr uint8_t TAG_HEADER_LEN = 2;  // tagNumber(1) + tagLength(1)
-
     struct CsaTag {
         uint8_t tagNumber   = 37;
         uint8_t tagLength   = 3;

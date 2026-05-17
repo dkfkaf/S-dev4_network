@@ -1,12 +1,11 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include <cstring>
 #include <vector>
 #include "dot11.h"
 
 // 태그 구조체(src)를 바이트 단위로 out 끝에 붙인다.
-static void append_tag(std::vector<uint8_t>& out, const void* src, size_t size) {
+inline void append_tag(std::vector<uint8_t>& out, const void* src, size_t size) {
     const uint8_t* p = static_cast<const uint8_t*>(src);
     out.insert(out.end(), p, p + size);
 }

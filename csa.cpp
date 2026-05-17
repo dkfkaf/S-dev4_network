@@ -79,7 +79,7 @@ int main(int argc, char* argv[]) {
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* pcap = pcap_open_live(ifname, 65535, 1, 1 , errbuf);
+    pcap_t* pcap = pcap_open_live(ifname, 65535, 1, 1, errbuf);
     if (!pcap) {
         std::cerr << "pcap_open_live : " << errbuf << "\n"
                   << "  -> root 권한과 monitor mode 인터페이스를 확인하세요.\n";

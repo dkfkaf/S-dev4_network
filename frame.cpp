@@ -46,8 +46,7 @@ std::vector<uint8_t> build_csa_beacon(
 
     // 새 Radiotap 헤더 + 원본 Dot11/Beacon 고정 파라미터 복사
     const Dot11RadioTap txRt{};
-    out.resize(sizeof(txRt));  // size를 8로 늘리고 0으로 초기화
-    std::memcpy(out.data(), &txRt, sizeof(txRt));  // 그 자리에 실제 값 덮어씀
+    append_tag(out, &txRt, sizeof(txRt));
     out.insert(out.end(), dot11Start, dot11Start + BEACON_FIXED_LEN);
 
     // 유니캐스트 시 수신 MAC(addr1)을 STA 주소로 교체
