@@ -132,7 +132,18 @@ static void append_to(std::vector<uint8_t>& out, const void* structPtr, size_t s
 
 // 기존 Tagged Parameters에서 CSA/ECSA를 제거하고,
 // 태그 번호 오름차순을 유지하며 새 csa/ecsa를 올바른 위치에 삽입한다.
-inline void insert_tags_sorted(
+//
+// 802.11 태그는 메모리에 항상 이 구조로 나열된다:
+//   [num(1바이트)][len(1바이트)][data(len바이트)] [num][len][data] ...
+//   예) [37][3][AA][BB][CC][40][2][DD][EE]
+//        0   1  2   3   4   5   6  7   8
+//
+//   tags[i]   = 태그 번호 (num)
+//   tags[i+1] = 데이터 크기 (len)
+//   next_tagIdx    = i + 2 + len → 이 태그가 끝나고 다음 태그가 시작되는 인덱스
+//   i = next_tagIdx 로 이동하면 다음 태그로 넘어간다.
+//   i + 2 <= tagsLen : 번호+길이 읽을 공간(최소 2칸)이 남아있는지 확인
+inline void insert_tag(
     std::vector<uint8_t>&  out,
     const uint8_t*         tags,
     size_t                 tagsLen,
@@ -142,23 +153,23 @@ inline void insert_tags_sorted(
     bool csaInserted  = false;
     bool ecsaInserted = false;
 
-    const uint8_t* tagsEnd = tags + tagsLen;
+    for (size_t i = 0; i + 2 <= tagsLen; ) {
+        uint8_t num    = tags[i];      // 태그 번호
+        uint8_t len    = tags[i + 1];  // 데이터 크기
+        size_t  next_tagIdx = i + 2 + len;  // 다음 태그 시작 인덱스
 
-    for (const uint8_t* p = tags; tagsEnd - p >= Beacon::TAG_HEADER_LEN; ) {
-        uint8_t          num    = p[0];
-        uint8_t          len    = p[1];
-        const uint8_t*   tagEnd = p + Beacon::TAG_HEADER_LEN + len;  // 이 태그의 끝 주소
+        if (next_tagIdx > tagsLen) break;  // 손상된 TLV 방어
 
-        if (tagEnd > tagsEnd) break;  // 손상된 TLV 방어
-
-        if (num == 37 || num == 60) { p = tagEnd; continue; }  // 기존 CSA/ECSA 제거
+        if (num == 37 || num == 60) { i = next_tagIdx; continue; }  // 기존 CSA/ECSA는 out에 담지 않고 건너뜀
 
         // 현재 태그보다 번호가 작은 CSA/ECSA를 먼저 삽입해 정렬 유지
         if (!csaInserted  && num >= 37) { append_to(out, &csa,  sizeof(csa));  csaInserted  = true; }
         if (!ecsaInserted && num >= 60) { append_to(out, &ecsa, sizeof(ecsa)); ecsaInserted = true; }
 
-        out.insert(out.end(), p, tagEnd);  // 기존 태그 복사
-        p = tagEnd;
+        const uint8_t* tagStart = tags + i;
+        const uint8_t* tagEnd   = tags + next_tagIdx;
+        out.insert(out.end(), tagStart, tagEnd);  // 기존 태그 한 개 복사
+        i = next_tagIdx;
     }
 
     // 삽입 위치를 못 찾은 태그는 맨 뒤에 추가

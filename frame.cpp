@@ -58,7 +58,7 @@ std::vector<uint8_t> build_csa_beacon(
     }
 
     // 기존 태그 정렬을 유지하며 CSA/ECSA 삽입
-    insert_tags_sorted(out, dot11Start + BEACON_FIXED_LEN, layout.tagsLen,
+    insert_tag(out, dot11Start + BEACON_FIXED_LEN, layout.tagsLen,
                        Beacon::CsaTag{}, Beacon::EcsaTag{});
     return out;
 }
