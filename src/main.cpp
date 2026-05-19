@@ -16,8 +16,10 @@ static void print_frame(const ParsedFrame& f) {
         << "  src="   << f.src.toString()
         << "  dst="   << f.dst.toString()
         << "  bssid=" << f.bssid.toString();
-    if (!f.ssid.empty())
-        std::cout << "  ssid=\"" << f.ssid << "\"";
+    if (f.hasSsid) {
+        if (f.ssid.empty()) std::cout << "  ssid=<hidden>";
+        else                std::cout << "  ssid=\"" << f.ssid << "\"";
+    }
     if (f.hasRssi)
         std::cout << "  rssi=" << static_cast<int>(f.rssi) << "dBm";
     std::cout << "\n";
