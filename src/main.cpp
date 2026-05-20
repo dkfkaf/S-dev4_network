@@ -16,12 +16,12 @@ static void print_frame(const ParsedFrame& f) {
         << "  src="   << f.src.toString()
         << "  dst="   << f.dst.toString()
         << "  bssid=" << f.bssid.toString();
-    if (f.hasSsid) {
-        if (f.ssid.empty()) std::cout << "  ssid=<hidden>";
-        else                std::cout << "  ssid=\"" << f.ssid << "\"";
+    if (f.ssid.has_value()) {
+        if (f.ssid.value().empty()) std::cout << "  ssid=<hidden>";
+        else                        std::cout << "  ssid=\"" << f.ssid.value() << "\"";
     }
-    if (f.hasRssi)
-        std::cout << "  rssi=" << static_cast<int>(f.rssi) << "dBm";
+    if (f.rssi.has_value())
+        std::cout << "  rssi=" << static_cast<int>(f.rssi.value()) << "dBm";
     std::cout << "\n";
 }
 
@@ -76,7 +76,9 @@ int main(int argc, char* argv[]) {
         }
 
         auto frame = parse_mgmt_frame(pkt, hdr->caplen);
-        if (frame) print_frame(*frame);
+        if (frame.has_value()) {
+            print_frame(frame.value());
+        }
     }
 
     std::cout << "\n[*] stopping ...\n";

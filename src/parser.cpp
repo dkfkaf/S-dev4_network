@@ -1,81 +1,42 @@
 #include "pch.h"
 #include "mgmt_parser.h"
 #include "dot11.h"
-#include "tag.h"
 
 // Radiotap 헤더에서 DBM_SIGNAL(RSSI) 값을 추출한다.
-// 호출자가 이미 읽어둔 Dot11RadioTap을 받아 중복 memcpy를 피한다.
-//
-// Radiotap 필드는 it_present 비트마스크의 비트 순서(0→31)대로 버퍼에 배치된다.
-// 따라서 DBM_SIGNAL(bit 5)을 읽으려면 앞에 오는 필드들을 크기만큼 순서대로 건너뛰어야 한다.
-//   bit 0 TSFT    : 8바이트, align 8
-//   bit 1 FLAGS   : 1바이트
-//   bit 2 RATE    : 1바이트
-//   bit 3 CHANNEL : 4바이트(freq+flags), align 2
-//   bit 4 FHSS    : 2바이트
-//   bit 5 DBM_SIGNAL ← 여기
-//
-// 확장 present 워드(bit 31=EXT)가 있으면 필드 데이터는 모든 present 워드 다음에서
-// 시작하므로, 필드를 읽기 전에 확장 워드를 전부 건너뛴다.
-static bool extract_rssi(const Dot11RadioTap& rt,
-                         const uint8_t* rtBuf, size_t rtLen,
-                         int8_t& rssiOut) {
-    if (!(rt.it_present & Dot11RadioTap::PRESENT_DBM_SIGNAL)) return false;
+// present: it_present 비트마스크,  pktBuf: 패킷 시작 포인터,  radiotapLen: radiotap 헤더 길이.
+static std::optional<int8_t> extract_rssi(uint32_t present,
+                                          const uint8_t* pktBuf, size_t radiotapLen) {
+    if (!(present & Dot11RadioTap::PRESENT_DBM_SIGNAL)) return std::nullopt;
 
-    // 확장 present 워드를 모두 건너뛴다 — 필드 데이터는 그 뒤에서 시작
-    size_t   cursor = sizeof(Dot11RadioTap);
-    uint32_t p      = rt.it_present;
-    while (p & Dot11RadioTap::PRESENT_EXT) {
-        if (cursor + sizeof(uint32_t) > rtLen) return false;
-        std::memcpy(&p, rtBuf + cursor, sizeof(p));
-        cursor += sizeof(uint32_t);
-    }
-
-    // 첫 번째 present 워드(표준 namespace)의 비트 순서대로 필드를 건너뛴다.
-    // 확장 워드의 필드들은 표준 필드 뒤에 위치하므로 여기서는 고려하지 않는다.
-    uint32_t present = rt.it_present;
-
-    if (present & Dot11RadioTap::PRESENT_TSFT) {           // bit 0: 8바이트, align 8
-        cursor = Dot11RadioTap::alignTo(cursor, 8);
-        if (cursor + sizeof(uint64_t) > rtLen) return false;
-        cursor += sizeof(uint64_t);
-    }
-    if (present & Dot11RadioTap::PRESENT_FLAGS) {          // bit 1: 1바이트
-        if (cursor + 1 > rtLen) return false;
-        cursor += 1;
-    }
-    if (present & Dot11RadioTap::PRESENT_RATE) {           // bit 2: 1바이트
-        if (cursor + 1 > rtLen) return false;
-        cursor += 1;
-    }
-    if (present & Dot11RadioTap::PRESENT_CHANNEL) {        // bit 3: 4바이트(freq+flags), align 2
-        cursor = Dot11RadioTap::alignTo(cursor, 2);
-        if (cursor + 2 * sizeof(uint16_t) > rtLen) return false;
-        cursor += 2 * sizeof(uint16_t);
-    }
-    if (present & Dot11RadioTap::PRESENT_FHSS) {           // bit 4: 2바이트
-        if (cursor + sizeof(uint16_t) > rtLen) return false;
-        cursor += sizeof(uint16_t);
-    }
+    size_t cursor;
+    if (!skipExtPresents(pktBuf, radiotapLen, present, cursor)) return std::nullopt;
+    if (!advanceToField(present, radiotapLen,
+                        Dot11RadioTap::PRESENT_DBM_SIGNAL, cursor)) return std::nullopt;
 
     // bit 5 DBM_SIGNAL: 부호 있는 1바이트 (dBm)
-    if (cursor + 1 > rtLen) return false;
-    rssiOut = static_cast<int8_t>(rtBuf[cursor]);
-    return true;
+    if (cursor + 1 > radiotapLen) return std::nullopt;
+    return static_cast<int8_t>(pktBuf[cursor]);
 }
 
 // Tagged Parameters에서 SSID(태그 0)를 찾는다.
-// 태그가 존재하면 ssid에 값을 채우고 true 반환 (len=0이면 hidden SSID = 빈 문자열).
-// 태그 자체가 없으면 false 반환 — SSID 미포함 프레임과 hidden SSID를 구분할 수 있다.
-static bool extract_ssid(const uint8_t* tags, size_t tagsLen, std::string& ssid) {
-    bool found = false;
-    scan_tags(tags, tagsLen, [&](TagView tv) -> bool {
-        if (tv.num != 0) return true;   // 태그 0이 아니면 계속 탐색
-        ssid.assign(tv.data, tv.data + tv.len);
-        found = true;
-        return false;  // 찾았으면 순회 중단
-    });
-    return found;
+// 태그가 존재하면 ssid 문자열을 담은 optional 반환 (len=0이면 hidden SSID = 빈 문자열).
+// 태그 자체가 없으면 nullopt 반환 — SSID 미포함 프레임과 hidden SSID를 구분할 수 있다.
+//
+// TLV 와이어 포맷: [num : 1B][len : 1B][data : len B] ... 반복
+//   - i + 2 <= tagsLen : num·len 헤더 2바이트를 읽을 공간 확인
+//   - next > tagsLen   : len 이 남은 버퍼 초과 → 손상 TLV 로 판단하고 안전 종료
+static std::optional<std::string> extract_ssid(const uint8_t* tags, size_t tagsLen) {
+    for (size_t i = 0; i + 2 <= tagsLen; ) {
+        uint8_t num  = tags[i];
+        uint8_t len  = tags[i + 1];
+        size_t  next = i + 2 + len;
+        if (next > tagsLen) break;       // 손상 TLV — 안전 종료
+
+        if (num == 0)                    // SSID 태그 발견 (len=0 이면 hidden SSID)
+            return std::string(tags + i + 2, tags + i + 2 + len);
+        i = next;
+    }
+    return std::nullopt;
 }
 
 // 802.11 management frame 한 개를 파싱해 ParsedFrame을 반환한다.
@@ -100,12 +61,8 @@ std::optional<ParsedFrame> parse_mgmt_frame(const uint8_t* data, size_t len) {
     Dot11 dot11;
     std::memcpy(&dot11, dot11Ptr, sizeof(Dot11));
 
-    // frameControl 하위 바이트 레이아웃: [version(0-1)][type(2-3)][subtype(4-7)]
-    uint8_t lowByte      = static_cast<uint8_t>(dot11.frameControl & 0xFF);
-    uint8_t frameType    = (lowByte >> 2) & 0x3;
-    uint8_t frameSubtype = (lowByte >> 4) & 0xF;
-
-    if (frameType != DOT11_TYPE_MGMT) return std::nullopt;
+    if (dot11.type() != DOT11_TYPE_MGMT) return std::nullopt;
+    uint8_t frameSubtype = dot11.subtype();
 
     // 첫 번째 switch: 지원 서브타입인지 확인하고 frameType을 결정한다.
     // 알 수 없는 서브타입은 여기서 nullopt 반환해 이후 코드는 7가지 케이스만 고려하면 된다.
@@ -121,10 +78,10 @@ std::optional<ParsedFrame> parse_mgmt_frame(const uint8_t* data, size_t len) {
         default: return std::nullopt;
     }
 
-    result.dst     = dot11.addr1;     // addr1 = 수신자
-    result.src     = dot11.addr2;     // addr2 = 송신자
-    result.bssid   = dot11.addr3;     // addr3 = BSSID (서브타입 불문 공통)
-    result.hasRssi = extract_rssi(rt, data, rtLen, result.rssi);
+    result.dst   = dot11.addr1;     // addr1 = 수신자
+    result.src   = dot11.addr2;     // addr2 = 송신자
+    result.bssid = dot11.addr3;     // addr3 = BSSID (서브타입 불문 공통)
+    result.rssi  = extract_rssi(rt.it_present, data, rtLen);
 
     // 두 번째 switch: 서브타입별 fixed params 크기를 구해 Tagged Parameters 시작 위치를 계산한다.
     // Dot11(24바이트) + fixed params 바로 다음부터 Tagged Parameters가 시작된다.
@@ -150,7 +107,7 @@ std::optional<ParsedFrame> parse_mgmt_frame(const uint8_t* data, size_t len) {
     // Tagged Parameters 범위: [tagsStart, frameEnd)
     size_t tagsStart = rtLen + sizeof(Dot11) + fixedLen;
     if (tagsStart < frameEnd)
-        result.hasSsid = extract_ssid(data + tagsStart, frameEnd - tagsStart, result.ssid);
+        result.ssid = extract_ssid(data + tagsStart, frameEnd - tagsStart);
 
     return result;
 }
