@@ -39,7 +39,6 @@ struct Dot11RadioTap {
 
     uint16_t len() const { return it_len; }
 
-    // 정의는 pack(pop) 이후 — skipExtPresents/advanceToField 자유 함수 참조
     bool hasFCS(const uint8_t* rtBuf) const;
 
     Dot11RadioTap(uint16_t initLen = sizeof(Dot11RadioTap), uint32_t present = 0)
@@ -58,9 +57,6 @@ struct Dot11 {
     Mac      addr3;
     uint16_t seqCtrl;
 
-    // Frame Control 하위 바이트 비트 레이아웃: [subtype(4-7)][type(2-3)][version(0-1)]
-    // shift+mask 로 명시적으로 추출 — 비트 필드를 쓰면 컴파일러별 레이아웃 차이로
-    // 와이어 포맷이 깨질 수 있어 의도적으로 피한다.
     uint8_t type()    const { return (frameControl >> 2) & 0x3; }
     uint8_t subtype() const { return (frameControl >> 4) & 0xF; }
 
@@ -96,25 +92,21 @@ struct Beacon {
     };
 };
 
-// Deauthentication 고정 파라미터
 struct Deauth {
     uint16_t reasonCode;
 };
 
-// Authentication 고정 파라미터
 struct Auth {
     uint16_t authAlgorithm;
     uint16_t authSeqNum;
     uint16_t statusCode;
 };
 
-// Association Request 고정 파라미터
 struct AssocReq {
     uint16_t capabilityInfo;
     uint16_t listenInterval;
 };
 
-// Association Response 고정 파라미터
 struct AssocResp {
     uint16_t capabilityInfo;
     uint16_t statusCode;
@@ -123,10 +115,8 @@ struct AssocResp {
 
 #pragma pack(pop)
 
-// 802.11 frame type (frameControl 하위 바이트 bits 2-3)
 inline constexpr uint8_t DOT11_TYPE_MGMT = 0x00;
 
-// Management frame subtypes (frameControl 하위 바이트 bits 4-7)
 inline constexpr uint8_t MGMT_SUBTYPE_ASSOC_REQ  = 0;
 inline constexpr uint8_t MGMT_SUBTYPE_ASSOC_RESP = 1;
 inline constexpr uint8_t MGMT_SUBTYPE_PROBE_REQ  = 4;
@@ -146,8 +136,6 @@ static_assert(sizeof(Auth)             == 6,  "Auth must be 6 bytes");
 static_assert(sizeof(AssocReq)         == 4,  "AssocReq must be 4 bytes");
 static_assert(sizeof(AssocResp)        == 6,  "AssocResp must be 6 bytes");
 
-// Radiotap 필드 레이아웃 — pack 영역 밖에 정의해 size_t 자연 정렬 보장.
-// 새 필드를 지원할 때는 여기 한 줄만 추가하면 advanceToField 가 자동으로 처리한다.
 struct RadiotapFieldDesc { uint32_t presentBit; size_t size; size_t align; };
 inline constexpr RadiotapFieldDesc RADIOTAP_LAYOUT[] = {
     { Dot11RadioTap::PRESENT_TSFT,        8, 8 },
@@ -167,8 +155,6 @@ inline constexpr RadiotapFieldDesc RADIOTAP_LAYOUT[] = {
     { Dot11RadioTap::PRESENT_RX_FLAGS,    2, 2 },
 };
 
-// 확장 present 워드(bit 31=EXT)를 모두 건너뛰고 첫 필드 데이터 시작 위치를 cursor 에 채움.
-// 모든 radiotap 필드 추출의 공통 진입 단계.
 inline bool skipExtPresents(const uint8_t* rtBuf, size_t rtLen,
                             uint32_t firstPresent, size_t& cursor) {
     cursor = sizeof(Dot11RadioTap);
@@ -181,9 +167,6 @@ inline bool skipExtPresents(const uint8_t* rtBuf, size_t rtLen,
     return true;
 }
 
-// present 마스크를 따라 RADIOTAP_LAYOUT 을 순회하며 targetBit 직전까지 cursor 를 전진시킨다.
-// targetBit 자체는 건너뛰지 않는다 — 호출자가 읽을 차례.
-// 호출 전에 skipExtPresents 로 cursor 를 첫 필드 시작 위치로 맞춰두어야 한다.
 inline bool advanceToField(uint32_t present, size_t rtLen,
                            uint32_t targetBit, size_t& cursor) {
     for (const auto& f : RADIOTAP_LAYOUT) {
@@ -198,18 +181,12 @@ inline bool advanceToField(uint32_t present, size_t rtLen,
 }
 
 inline bool Dot11RadioTap::hasFCS(const uint8_t* rtBuf) const {
-    // FLAGS 필드 자체가 없으면 FCS 비트도 확인할 수 없으므로 false.
     if (!(it_present & PRESENT_FLAGS)) return false;
 
-    // FLAGS 필드 시작 오프셋까지 cursor 를 전진시킨다.
-    //   1) 확장 present 워드들을 건너뛰고 첫 필드 데이터 위치로 이동
-    //   2) 레이아웃 테이블을 따라 FLAGS 직전 필드(TSFT)까지 건너뛰기
-    // 두 단계 중 하나라도 버퍼 끝을 넘으면 안전하게 false 반환.
     size_t cursor;
     if (!skipExtPresents(rtBuf, it_len, it_present, cursor)) return false;
     if (!advanceToField(it_present, it_len, PRESENT_FLAGS, cursor)) return false;
 
-    // FLAGS 는 1바이트이므로 cursor 위치에 최소 1바이트가 남아있어야 한다.
     if (cursor >= it_len) return false;
     return (rtBuf[cursor] & FLAG_FCS_AT_END) != 0;
 }

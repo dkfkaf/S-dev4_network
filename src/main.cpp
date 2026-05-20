@@ -50,7 +50,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 관리 프레임만 캡처
     bpf_program fp;
     if (pcap_compile(pcap, &fp, "type mgt", 1, PCAP_NETMASK_UNKNOWN) == 0) {
         pcap_setfilter(pcap, &fp);
