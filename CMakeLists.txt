@@ -35,8 +35,12 @@ message(STATUS "PCAP library : ${PCAP_LIBRARY}")
 
 add_executable(wips-parser
     src/main.cpp
-    src/parser.cpp
+    src/parser/parser.cpp
+    src/detector/deauth_detector.cpp
+    src/hopper/channel_hopper.cpp
 )
+
+find_package(Threads REQUIRED)
 
 target_precompile_headers(wips-parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/pch.h
@@ -44,11 +48,15 @@ target_precompile_headers(wips-parser PRIVATE
 
 target_include_directories(wips-parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/parser
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/hopper
     ${PCAP_INCLUDE_DIR}
 )
 
 target_link_libraries(wips-parser PRIVATE
     ${PCAP_LIBRARY}
+    Threads::Threads
 )
 
 target_compile_options(wips-parser PRIVATE

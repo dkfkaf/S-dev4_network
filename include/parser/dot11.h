@@ -69,22 +69,40 @@ struct Dot11 {
     }
 };
 
+// IEEE 802.11 Information Element 공통 헤더 뷰. CsaTag/EcsaTag도 처음 두 바이트(num, len)가 동일 레이아웃.
+// 본질이 byte buffer ↔ typed pointer reinterpretation이라 캐스트는 의도적으로 C-style을 사용한다.
+struct Dot11Tag {
+    uint8_t num;
+    uint8_t len;
+
+    bool isValid(const uint8_t* end) const {
+        const uint8_t* p = (const uint8_t*)this;
+        return (p + sizeof(Dot11Tag) <= end) && (p + sizeof(Dot11Tag) + len <= end);
+    }
+
+    uint8_t*       value()       { return (uint8_t*)(this + 1); }
+    const uint8_t* value() const { return (const uint8_t*)(this + 1); }
+
+    Dot11Tag*       next()       { return (Dot11Tag*)((uint8_t*)this + sizeof(Dot11Tag) + len); }
+    const Dot11Tag* next() const { return (const Dot11Tag*)((const uint8_t*)this + sizeof(Dot11Tag) + len); }
+};
+
 struct Beacon {
     uint64_t timestamp;
     uint16_t beaconInterval;
     uint16_t capabilityInfo;
 
     struct CsaTag {
-        uint8_t tagNumber   = 37;
-        uint8_t tagLength   = 3;
+        uint8_t num         = 37;
+        uint8_t len         = 3;
         uint8_t switchMode  = 1;
         uint8_t newChannel  = 11;
         uint8_t switchCount = 0;
     };
 
     struct EcsaTag {
-        uint8_t tagNumber   = 60;
-        uint8_t tagLength   = 4;
+        uint8_t num         = 60;
+        uint8_t len         = 4;
         uint8_t switchMode  = 1;
         uint8_t newOpClass  = 81;
         uint8_t newChannel  = 11;
@@ -115,19 +133,41 @@ struct AssocResp {
 
 #pragma pack(pop)
 
-inline constexpr uint8_t DOT11_TYPE_MGMT = 0x00;
+// frameControl bits 3-2 — frame type
+enum Dot11Type : uint8_t {
+    DOT11_TYPE_MGMT = 0x00,
+    DOT11_TYPE_CTRL = 0x01,
+    DOT11_TYPE_DATA = 0x02,
+};
 
-inline constexpr uint8_t MGMT_SUBTYPE_ASSOC_REQ  = 0;
-inline constexpr uint8_t MGMT_SUBTYPE_ASSOC_RESP = 1;
-inline constexpr uint8_t MGMT_SUBTYPE_PROBE_REQ  = 4;
-inline constexpr uint8_t MGMT_SUBTYPE_PROBE_RESP = 5;
-inline constexpr uint8_t MGMT_SUBTYPE_BEACON     = 8;
-inline constexpr uint8_t MGMT_SUBTYPE_AUTH       = 11;
-inline constexpr uint8_t MGMT_SUBTYPE_DEAUTH     = 12;
+// frameControl bits 7-4 — management frame subtype
+enum Dot11MgmtSubtype : uint8_t {
+    MGMT_SUBTYPE_ASSOC_REQ  = 0,
+    MGMT_SUBTYPE_ASSOC_RESP = 1,
+    MGMT_SUBTYPE_PROBE_REQ  = 4,
+    MGMT_SUBTYPE_PROBE_RESP = 5,
+    MGMT_SUBTYPE_BEACON     = 8,
+    MGMT_SUBTYPE_AUTH       = 11,
+    MGMT_SUBTYPE_DEAUTH     = 12,
+};
+
+inline const char* toString(Dot11MgmtSubtype s) {
+    switch (s) {
+        case MGMT_SUBTYPE_ASSOC_REQ:  return "AssocReq";
+        case MGMT_SUBTYPE_ASSOC_RESP: return "AssocResp";
+        case MGMT_SUBTYPE_PROBE_REQ:  return "ProbeReq";
+        case MGMT_SUBTYPE_PROBE_RESP: return "ProbeResp";
+        case MGMT_SUBTYPE_BEACON:     return "Beacon";
+        case MGMT_SUBTYPE_AUTH:       return "Auth";
+        case MGMT_SUBTYPE_DEAUTH:     return "Deauth";
+    }
+    return "Unknown";
+}
 
 static_assert(sizeof(Mac)              == 6,  "Mac must be 6 bytes");
 static_assert(sizeof(Dot11RadioTap)    == 8,  "Dot11RadioTap fixed header must be 8 bytes");
 static_assert(sizeof(Dot11)            == 24, "Dot11 must be 24 bytes");
+static_assert(sizeof(Dot11Tag)         == 2,  "Dot11Tag must be 2 bytes");
 static_assert(sizeof(Beacon)           == 12, "Beacon fixed params must be 12 bytes");
 static_assert(sizeof(Beacon::CsaTag)   == 5,  "CsaTag must be 5 bytes");
 static_assert(sizeof(Beacon::EcsaTag)  == 6,  "EcsaTag must be 6 bytes");
@@ -155,6 +195,10 @@ inline constexpr RadiotapFieldDesc RADIOTAP_LAYOUT[] = {
     { Dot11RadioTap::PRESENT_RX_FLAGS,    2, 2 },
 };
 
+inline size_t alignTo(size_t cursor, size_t align) {
+    return (cursor + align - 1) & ~(align - 1);
+}
+
 inline bool skipExtPresents(const uint8_t* rtBuf, size_t rtLen,
                             uint32_t firstPresent, size_t& cursor) {
     cursor = sizeof(Dot11RadioTap);
@@ -172,7 +216,7 @@ inline bool advanceToField(uint32_t present, size_t rtLen,
     for (const auto& f : RADIOTAP_LAYOUT) {
         if (f.presentBit == targetBit) return true;
         if (present & f.presentBit) {
-            cursor = (cursor + f.align - 1) & ~(f.align - 1);
+            cursor = alignTo(cursor, f.align);
             if (cursor + f.size > rtLen) return false;
             cursor += f.size;
         }
