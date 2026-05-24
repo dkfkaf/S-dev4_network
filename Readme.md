@@ -26,7 +26,7 @@
 - **3-tier severity**: info / warn / critical
 - **Escalation 인지 cooldown**: 같은 severity는 throttle, 더 심각해지면 즉시 발사
 - **Per-channel cooldown**: 채널별로 독립 cooldown (채널 hopping 중 다른 채널의 새 공격 놓치지 않음)
-- **Idle eviction**: 활동 없는 source 자동 정리 (메모리 누수 방지)
+- **Idle source 자동 제거**: 활동 없는 source 자동 정리 (메모리 누수 방지)
 - **Thread-safe**: 듀얼 어댑터 운용 시 두 capture thread가 안전하게 공유
 
 ### 3. Channel Hopping
@@ -202,7 +202,7 @@ sudo ./wips-parser mon0 mon1
 | Per-source warn | 10 events |
 | Per-source critical | 20 events |
 | Alert cooldown | 3초 |
-| Idle source eviction | 5분 |
+| Idle source 제거 임계 | 5분 |
 
 ### Channel list 기본값
 **Single-adapter** (`ChannelHopConfig{}`): 11채널 × 500ms = 5.5초 cycle
@@ -222,7 +222,7 @@ sudo ./wips-parser mon0 mon1
 각 모듈의 동작 원리와 설계 결정은 `help/` 폴더 참조:
 
 - [`help/channel_hopper.md`](help/channel_hopper.md) — Channel hopping 모듈 상세 (fork/execlp, condition_variable, 채널별 실패 추적, 듀얼 어댑터)
-- [`help/deauth_detector.md`](help/deauth_detector.md) — Deauth flood detector 상세 (sliding window, cooldown + escalation, per-channel cooldown, idle eviction)
+- [`help/deauth_detector.md`](help/deauth_detector.md) — Deauth flood detector 상세 (sliding window, cooldown + escalation, per-channel cooldown, idle source 제거)
 
 ---
 

@@ -1,11 +1,14 @@
 #pragma once
 #include <chrono>
+#include <cstdint>
 #include <optional>
-#include <string>
 #include "mac.h"
 
-// 순서(info < warn < critical)가 의미적 ordering — escalation 비교에 활용.
+using TimePoint = std::chrono::steady_clock::time_point;
+
 enum class AlertSeverity { info, warn, critical };
+
+enum class AlertScope { global, perSource };
 
 inline const char* toString(AlertSeverity s) {
     switch (s) {
@@ -17,9 +20,13 @@ inline const char* toString(AlertSeverity s) {
 }
 
 struct Alert {
-    AlertSeverity                         severity;
-    std::string                           message;
-    std::chrono::steady_clock::time_point ts;
-    std::optional<Mac>                    source;       // 전역=nullopt, per-source=해당 MAC
-    size_t                                windowCount;
+    AlertSeverity             severity;
+    AlertScope                scope;
+    TimePoint                 ts;
+    std::optional<Mac>        source;
+    size_t                    count;
+    std::chrono::milliseconds window;
+    std::optional<int>        channel;
+    std::optional<uint16_t>   reasonCode;
+    uint64_t                  total = 0;
 };

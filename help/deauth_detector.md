@@ -1,6 +1,6 @@
 # DeauthFloodDetector 코드 설명
 
-`include/deauth_detector.h` + `src/deauth_detector.cpp` 의 동작과 설계를 풀어 쓴 문서.
+`include/detector/deauth_detector.h` + `src/detector/deauth_detector.cpp` 의 동작과 설계를 풀어 쓴 문서.
 
 ---
 
@@ -21,10 +21,12 @@ Deauthentication 프레임은 정상 동작의 일부이기도 합니다 (AP가 
 `main.cpp`에서 패킷 파싱 후 Deauth 프레임이면 detector에 전달:
 ```cpp
 if (f.frameType == MGMT_SUBTYPE_DEAUTH) {
-    DeauthEvent ev{std::chrono::steady_clock::now(), f.src, ...};
-    for (const auto& a : detector.observe(ev)) print_alert(a);
+    // detector.observe()는 내부 mutex로 thread-safe
+    for (const auto& a : detector.observe(make_deauth_event(f))) print_alert(a);
 }
 ```
+
+**detector 모듈은 `ParsedFrame`을 모릅니다** — `ParsedFrame` → `DeauthEvent` 변환은 호출 측(main.cpp)의 `make_deauth_event()` 헬퍼가 담당. parser와 detector의 결합을 끊어서 detector를 다른 패킷 소스(테스트 mock, 다른 파서)에 재사용 가능하게 함.
 
 ---
 
@@ -41,7 +43,7 @@ if (f.frameType == MGMT_SUBTYPE_DEAUTH) {
                        │
                        ▼
 ┌────────────────────────────────────────────────────────┐
-│         DeauthFloodDetector::observe(ev)               │
+│         DeauthFloodDetector::observe(event)            │
 │                                                        │
 │  ┌─────────────────────┐  ┌──────────────────────┐    │
 │  │ Global window       │  │ Per-source window    │    │
@@ -84,7 +86,7 @@ deque: [t1, t2, t3, t4, ...]
 3. deque의 현재 길이 = "최근 10초 안에 발생한 이벤트 수"
 
 ```cpp
-void prune(Window& q, TimePoint cutoff) {
+void trimWindow(Window& q, TimePoint cutoff) {
     while (!q.empty() && q.front() < cutoff) q.pop_front();
 }
 ```
@@ -99,7 +101,7 @@ void prune(Window& q, TimePoint cutoff) {
                                   └──────────┤
                                   cutoff (= now - 10s)
                                   
-prune 이후 deque에 남은 것: [● ● ● ● ●] (5개)
+trimWindow 이후 deque에 남은 것: [● ● ● ● ●] (5개)
                             ↑
                             cutoff 이후의 것만
 ```
@@ -116,8 +118,12 @@ prune 이후 deque에 남은 것: [● ● ● ● ●] (5개)
 ## 4. `DeauthEvent` — 입력 구조
 
 ```cpp
+// TimePoint는 alert.h에서 정의 (alert/detector 공유). Window는 detector 전용 (sliding window).
+// using TimePoint = std::chrono::steady_clock::time_point;  // ← alert.h
+using Window    = std::deque<TimePoint>;
+
 struct DeauthEvent {
-    std::chrono::steady_clock::time_point ts;     // ✅ 사용
+    TimePoint                ts;                  // ✅ 사용
     Mac                      src;                 // ✅ 사용
     Mac                      dst;                 // 🔵 reserved
     Mac                      bssid;               // 🔵 reserved
@@ -125,6 +131,7 @@ struct DeauthEvent {
     std::optional<uint16_t>  reasonCode;          // ✅ alert 메시지에 표시
     std::optional<int>       channel;             // ✅ per-channel cooldown 키 + alert 표시
 };
+// ParsedFrame → DeauthEvent 변환은 main.cpp의 make_deauth_event()가 담당 (detector 모듈은 parser 무관).
 ```
 
 ### 사용되는 필드 4개
@@ -150,42 +157,55 @@ struct DeauthEvent {
 
 ---
 
-## 5. `DeauthSourceStats` — per-source 상태
+## 5. `DeauthSourceStats` + `CooldownState` — per-source 상태
 
 각 공격자 MAC마다 별도 인스턴스가 `std::map<Mac, DeauthSourceStats>`에 저장됩니다.
 
+### `CooldownState` (전역/per-source 공통)
 ```cpp
-struct DeauthSourceStats {
-    std::deque<TimePoint>          recent;             // 최근 윈도우 내 timestamp들
-    uint64_t                       total      = 0;     // 누적 카운트 (모든 시간)
-    TimePoint                      lastSeen;           // 마지막 발생 시각
-    std::optional<TimePoint>       lastAlert;          // 마지막 alert 시각
-    std::optional<AlertSeverity>   lastAlertSeverity;  // 마지막 alert의 severity
+// invariant: lastAlert와 lastAlertSeverity는 항상 동시 갱신
+struct CooldownState {
+    std::optional<TimePoint>     lastAlert;
+    std::optional<AlertSeverity> lastAlertSeverity;
 };
 ```
 
-- `recent`: 그 MAC의 sliding window. 윈도우 밖은 prune됨
+전역(채널별)/per-source 양쪽에서 동일한 형태로 재사용 → 코드 대칭성 확보.
+
+### `DeauthSourceStats`
+```cpp
+struct DeauthSourceStats {
+    Window         recent;        // 최근 윈도우 내 timestamp들
+    uint64_t       total = 0;     // 누적 카운트 (모든 시간)
+    TimePoint      lastSeen;      // 마지막 발생 시각
+    CooldownState  cd;            // cooldown + escalation 판단용 (자세한 건 §8)
+};
+```
+
+- `recent`: 그 MAC의 sliding window. 윈도우 밖 timestamp는 `trimWindow()`로 제거됨
 - `total`: 누적 — alert 메시지에 표시 ("이 공격자는 평생 1500번 deauth 보냄" 같은 forensic 정보)
 - `lastSeen`: idle 판단용 (오래 안 보이면 메모리에서 제거)
-- `lastAlert` / `lastAlertSeverity`: cooldown + escalation 판단용 (자세한 건 §8)
+- `cd`: `CooldownState` 임베드 — 접근은 `stats.cd.lastAlert`, `stats.cd.lastAlertSeverity`
 
 ---
 
-## 6. `DeauthThresholds` — 임계치
+## 6. `DeauthThresholds` + `SeverityTier` — 임계치
 
 ```cpp
+// info < warn < critical 단조 증가 가정.
+struct SeverityTier {
+    size_t info;
+    size_t warn;
+    size_t critical;
+};
+
 struct DeauthThresholds {
-    // 전역 — 전체 deauth flood
-    size_t globalInfo        = 10;
-    size_t globalWarn        = 20;
-    size_t globalCritical    = 40;
-    
-    // per-source — 같은 공격자 MAC에서 오는 deauth flood
-    size_t perSourceInfo     = 5;
-    size_t perSourceWarn     = 10;
-    size_t perSourceCritical = 20;
+    SeverityTier global    = {10, 20, 40};   // 전체 deauth flood
+    SeverityTier perSource = {5, 10, 20};    // 같은 공격자 MAC에서 오는 flood
 };
 ```
+
+`SeverityTier`로 묶어 두면 `severityFor(count, thresh_.global)` 처럼 호출 시 인자 1개로 압축 가능 — 6개 평면 필드보다 명시적.
 
 CLAUDE.md 스펙 기본값. 단위는 "윈도우(=10초) 안에 발생한 횟수".
 
@@ -210,7 +230,7 @@ DeauthFloodDetector(
     std::chrono::milliseconds window         = std::chrono::seconds(10),
     DeauthThresholds          thresh         = {},
     std::chrono::milliseconds cooldown       = std::chrono::seconds(3),
-    std::chrono::milliseconds idleEvictAfter = std::chrono::minutes(5));
+    std::chrono::milliseconds sourceIdleTimeout = std::chrono::minutes(5));
 ```
 
 | 파라미터 | 의미 | 기본값 |
@@ -218,11 +238,11 @@ DeauthFloodDetector(
 | `window` | sliding window 크기 — 몇 초 안의 이벤트를 셀지 | 10초 |
 | `thresh` | info/warn/critical 임계치 | 10/20/40 (global) |
 | `cooldown` | 같은 severity 알람의 최소 간격 (스팸 방지) | 3초 |
-| `idleEvictAfter` | source가 이만큼 안 보이면 메모리에서 제거 | 5분 |
+| `sourceIdleTimeout` | source가 이만큼 안 보이면 메모리에서 제거 | 5분 |
 
 ### Public API
 ```cpp
-std::vector<Alert> observe(const DeauthEvent& ev);  // 핵심. Thread-safe.
+std::vector<Alert> observe(const DeauthEvent& event);  // 핵심. Thread-safe.
 size_t globalCount() const;                          // 전역 윈도우 카운트 (lock 후 스냅샷)
 size_t trackedSources() const;                       // 추적 중인 source 수 (lock 후 스냅샷)
 std::optional<DeauthSourceStats> statsFor(const Mac& src) const;  // 특정 src 통계 스냅샷
@@ -234,68 +254,125 @@ std::optional<DeauthSourceStats> statsFor(const Mac& src) const;  // 특정 src 
 
 ## 8. `observe()` 흐름 — 핵심 메서드
 
+`observe()` 자체는 **orchestration 레이어**입니다. 세부 처리는 `processGlobalEvent()` / `processPerSourceEvent()` 두 private helper에 위임:
+
 ```cpp
-std::vector<Alert> DeauthFloodDetector::observe(const DeauthEvent& ev) {
+std::vector<Alert> DeauthFloodDetector::observe(const DeauthEvent& event) {
+    std::lock_guard<std::mutex> lock(mtx_);     // ⓪ thread-safe 진입
     std::vector<Alert> alerts;
 
     // ① timestamp 클램핑 (단조성 보장)
     const TimePoint now = globalEvents_.empty()
-        ? ev.ts
-        : std::max(ev.ts, globalEvents_.back());
+        ? event.ts
+        : std::max(event.ts, globalEvents_.back());
     const TimePoint cutoff = now - window_;
 
-    // ② 전역 윈도우 갱신
-    globalEvents_.push_back(now);
-    prune(globalEvents_, cutoff);
+    // ②③ 전역 차원: 윈도우 갱신 + alert 평가/발사
+    processGlobalEvent(event, now, cutoff, alerts);
 
-    // ③ 전역 severity 평가 + alert
-    if (severity가 임계치 넘고 cooldown 통과) {
-        alerts.push_back(...);
-    }
-
-    // ④ per-source 윈도우 갱신
-    DeauthSourceStats& s = sources_[ev.src];
-    s.recent.push_back(now);
-    prune(s.recent, cutoff);
-    s.total++;
-    s.lastSeen = now;
-
-    // ⑤ per-source severity 평가 + alert
-    if (severity가 임계치 넘고 cooldown 통과) {
-        alerts.push_back(...);
-    }
+    // ④⑤ per-source 차원: 윈도우/통계 갱신 + alert 평가/발사
+    processPerSourceEvent(event, now, cutoff, alerts);
 
     // ⑥ idle source 정리
-    evictIdleSources(now);
+    forgetIdleSources(now);
     return alerts;
 }
 ```
 
+`observe()`는 위에서 아래로 읽으면 흐름이 한눈에 보임. **각 차원(global / per-source)의 세부 로직은 self-contained helper로 분리** — 같은 시그니처 `(event, now, cutoff, alerts)`로 대칭 호출.
+
+### `processGlobalEvent()` 본문
+```cpp
+void DeauthFloodDetector::processGlobalEvent(const DeauthEvent& event,
+                                             TimePoint           now,
+                                             TimePoint           cutoff,
+                                             std::vector<Alert>& alerts) {
+    globalEvents_.push_back(now);
+    trimWindow(globalEvents_, cutoff);
+
+    const int channelKey = event.channel.value_or(-1);
+    CooldownState& gcd = globalCooldowns_[channelKey];
+
+    auto sev = severityFor(globalEvents_.size(), thresh_.global);
+    if (!sev.has_value() || !shouldAlert(gcd, sev.value(), now)) return;
+
+    /* Alert 데이터 (count, window, channel, ...) push + gcd 갱신 */
+}
+```
+
+### `processPerSourceEvent()` 본문
+```cpp
+void DeauthFloodDetector::processPerSourceEvent(const DeauthEvent& event,
+                                                TimePoint           now,
+                                                TimePoint           cutoff,
+                                                std::vector<Alert>& alerts) {
+    DeauthSourceStats& stats = sources_[event.src];
+    stats.recent.push_back(now);
+    trimWindow(stats.recent, cutoff);
+    stats.total++;
+    stats.lastSeen = now;
+
+    auto sev = severityFor(stats.recent.size(), thresh_.perSource);
+    if (!sev.has_value() || !shouldAlert(stats.cd, sev.value(), now)) return;
+
+    /* Alert 데이터 (count, window, channel, reasonCode, total) push + stats.cd 갱신 */
+}
+```
+
+두 helper는 거의 평행 구조 — `globalEvents_` ↔ `stats.recent`, `gcd` ↔ `stats.cd`, `thresh_.global` ↔ `thresh_.perSource`.
+
+### Alert는 **데이터 전용** — 메시지 빌드는 consumer 책임
+
+`Alert` 구조체에 미리 포맷된 string을 박아두지 않습니다. detector는 *"어떤 일이 일어났는지"* 정보만 채우고, 표현(plaintext/JSON/webhook)은 외부 consumer가 결정:
+
+```cpp
+// alert.h — TimePoint alias도 여기 정의 (alert/detector가 공유)
+using TimePoint = std::chrono::steady_clock::time_point;
+
+enum class AlertScope { global, perSource };   // 의도 명시 — source 유무 추론 안 함
+
+struct Alert {
+    AlertSeverity             severity;
+    AlertScope                scope;        // global vs perSource
+    TimePoint                 ts;
+    std::optional<Mac>        source;       // perSource인 경우만 set
+    size_t                    count;
+    std::chrono::milliseconds window;
+    std::optional<int>        channel;
+    std::optional<uint16_t>   reasonCode;   // perSource만 의미
+    uint64_t                  total = 0;    // perSource 누적 (global은 0)
+};
+```
+
+`scope` 필드는 `source.has_value()`로도 알 수 있지만 **의도 명시용 redundancy**. `format_alert(a)`가 `a.scope == AlertScope::global` 같이 자명한 분기를 사용 가능.
+
+`main.cpp`의 `format_alert()`가 이 데이터를 plaintext 한 줄로 포맷합니다 (예: `"global deauth flood: 50 events in last 10000ms (latest: ch=11)"`). 미래에 JSON output, Slack webhook 등 추가하려면 새 formatter만 작성하면 됨 — **detector는 손 안 댐**. 탐지(`DeauthFloodDetector`)와 전달(formatter)의 책임이 분리됨.
+
+`mtx_`는 `mutable` 멤버 — `globalCount()`/`trackedSources()`/`statsFor()` 같은 const 조회 메서드에서도 락 가능. private helper (`trimWindow`/`severityFor`/`shouldAlert`/`processGlobalEvent`/`processPerSourceEvent`/`forgetIdleSources`)는 caller가 락 잡은 상태에서만 호출되는 invariant.
+
 ### ① Timestamp 클램핑 — 왜?
 ```cpp
 const TimePoint now = globalEvents_.empty()
-    ? ev.ts
-    : std::max(ev.ts, globalEvents_.back());
+    ? event.ts
+    : std::max(event.ts, globalEvents_.back());
 ```
 
 `steady_clock`은 단조이지만, 만약 외부에서 ts를 주입(테스트나 미래의 확장)할 때 **역전된 timestamp**가 들어올 수 있습니다. 만약 그렇게 되면:
 - deque는 정렬된 상태가 깨짐
-- prune이 잘못 동작 (front()보다 작은 게 뒤에 있을 수 있음)
+- `trimWindow()`가 잘못 동작 (front()보다 작은 게 뒤에 있을 수 있음)
 
 방어책: 들어온 ts가 직전 최대값보다 작으면 **직전 최대값을 사용**. deque 정렬성 보장.
 
 ### ② / ④ 윈도우 갱신
-이미 §3에서 본 push + prune 패턴.
+이미 §3에서 본 push + trimWindow 패턴.
 
 ### ③ / ⑤ Severity 평가
 ```cpp
 static std::optional<AlertSeverity> severityFor(size_t count,
-                                                 size_t infoTh,
-                                                 size_t warnTh,
-                                                 size_t critTh) {
-    if (count >= critTh) return AlertSeverity::critical;
-    if (count >= warnTh) return AlertSeverity::warn;
-    if (count >= infoTh) return AlertSeverity::info;
+                                                const SeverityTier& tier) {
+    if (count >= tier.critical) return AlertSeverity::critical;
+    if (count >= tier.warn)     return AlertSeverity::warn;
+    if (count >= tier.info)     return AlertSeverity::info;
     return std::nullopt;
 }
 ```
@@ -306,7 +383,7 @@ static std::optional<AlertSeverity> severityFor(size_t count,
 
 ---
 
-## 9. Cooldown + Escalation 로직 — `shouldFire()`
+## 9. Cooldown + Escalation 로직 — `shouldAlert()`
 
 가장 미묘한 부분. 두 가지 상충하는 요구사항:
 
@@ -314,17 +391,17 @@ static std::optional<AlertSeverity> severityFor(size_t count,
 2. **escalation 즉시 알림**: 상황이 악화되면 (INFO → WARN → CRITICAL) **cooldown 무시하고** 즉시 알림
 
 ```cpp
-bool DeauthFloodDetector::shouldFire(
-    std::optional<AlertSeverity>    lastSev,
-    AlertSeverity                   currentSev,
-    const std::optional<TimePoint>& lastAlertTime,
-    TimePoint                       now) const
+bool DeauthFloodDetector::shouldAlert(const CooldownState& cd,
+                                      AlertSeverity        currentSev,
+                                      TimePoint            now) const
 {
-    if (!lastAlertTime.has_value()) return true;            // 첫 알람은 무조건
-    if (currentSev > lastSev.value()) return true;          // escalation은 즉시
-    return (now - lastAlertTime.value()) >= cooldown_;      // 같거나 낮은 severity는 cooldown 적용
+    if (!cd.lastAlert.has_value()) return true;                 // 첫 알람은 무조건
+    if (currentSev > cd.lastAlertSeverity.value()) return true; // escalation은 즉시
+    return (now - cd.lastAlert.value()) >= cooldown_;           // 같거나 낮은 severity는 cooldown 적용
 }
 ```
+
+`CooldownState`를 통째로 받음으로써 인자 4개 → 3개로 감소. 전역/per-source 둘 다 `CooldownState&` 한 형태로 호출 가능 — 호출 측 평행성 확보.
 
 ### 시나리오 예시
 window=10s, cooldown=3s 가정. count의 시간별 추이:
@@ -341,8 +418,8 @@ t=6  : count=40 (CRITICAL 임계치) → escalation, 즉시 발사 !
 
 만약 escalation 룰이 없었다면, t=2의 CRITICAL을 t=3에야 받게 됨 — 보안 사고에서 3초는 큼.
 
-### 왜 `lastSev.value()`를 그냥 부르나? (예외 위험)
-`lastAlertTime`이 set이면 `lastSev`도 같이 set됨 — 호출 측에서 둘을 동시에 갱신:
+### 왜 `cd.lastAlertSeverity.value()`를 그냥 부르나? (예외 위험)
+`cd.lastAlert`가 set이면 `cd.lastAlertSeverity`도 같이 set됨 — 호출 측에서 둘을 동시에 갱신:
 ```cpp
 gcd.lastAlert         = now;   // gcd = globalCooldowns_[channelKey]
 gcd.lastAlertSeverity = sev.value();
@@ -356,9 +433,9 @@ ChannelHopper가 채널을 바꾸면 사실상 다른 RF 환경에서 sniff하�
 해결: 전역 cooldown을 `std::map<int, CooldownState>` 로 채널별 분리.
 
 ```cpp
-const int channelKey = ev.channel.value_or(-1);  // 채널 정보 없으면 -1 키
+const int channelKey = event.channel.value_or(-1);  // 채널 정보 없으면 -1 키
 CooldownState& gcd = globalCooldowns_[channelKey];
-if (shouldFire(gcd.lastAlertSeverity, sev, gcd.lastAlert, now)) {
+if (shouldAlert(gcd, sev, now)) {
     // 이 채널의 cooldown만 확인. 다른 채널의 alert는 영향 없음.
 }
 ```
@@ -367,7 +444,7 @@ per-source cooldown은 그대로 단일 trackr (source MAC은 채널과 독립�
 
 ---
 
-## 10. 메모리 관리 — `evictIdleSources()`
+## 10. 메모리 관리 — `forgetIdleSources()`
 
 ### 문제
 공격자가 매번 random source MAC을 spoofing하면 `sources_` 맵이 무한히 커집니다. 장기 실행 daemon이면 메모리 누수.
@@ -376,15 +453,15 @@ per-source cooldown은 그대로 단일 trackr (source MAC은 채널과 독립�
 주기적으로 "오래 안 보인 source"는 제거.
 
 ```cpp
-void DeauthFloodDetector::evictIdleSources(TimePoint now) {
+void DeauthFloodDetector::forgetIdleSources(TimePoint now) {
     // throttle: 너무 자주 스캔하지 않음
-    if (lastEvictionRun_.has_value() &&
-        (now - lastEvictionRun_.value()) < evictionInterval_) return;
-    lastEvictionRun_ = now;
+    if (lastRemovalRun_.has_value() &&
+        (now - lastRemovalRun_.value()) < removalInterval_) return;
+    lastRemovalRun_ = now;
 
     for (auto it = sources_.begin(); it != sources_.end(); ) {
-        const auto& s = it->second;
-        if (s.recent.empty() && (now - s.lastSeen) > idleEvictAfter_) {
+        const auto& stats = it->second;
+        if (stats.recent.empty() && (now - stats.lastSeen) > sourceIdleTimeout_) {
             it = sources_.erase(it);
         } else {
             ++it;
@@ -394,14 +471,14 @@ void DeauthFloodDetector::evictIdleSources(TimePoint now) {
 ```
 
 ### 정책
-- **30초마다** 한 번 스캔 (`evictionInterval_=30s` 하드코딩, 매 observe()마다 스캔하면 비효율적)
-- `recent`가 비어있고 (윈도우 내 활동 없음) + `lastSeen`이 `idleEvictAfter_`(=5분)보다 오래된 source 제거
+- **30초마다** 한 번 스캔 (`removalInterval_=30s` 하드코딩, 매 observe()마다 스캔하면 비효율적)
+- `recent`가 비어있고 (윈도우 내 활동 없음) + `lastSeen`이 `sourceIdleTimeout_`(=5분)보다 오래된 source 제거
 
 ### 활성 source는 절대 안 지움
 `recent`가 비어있다는 건 윈도우 내 활동 0건 = 사실상 inactive. 활성 공격자는 `recent.size() > 0`이라 안전.
 
 ### 누적 통계 손실
-evict된 source의 `total` 카운트는 사라집니다. 5분간 활동 없는 source의 누적은 잊어도 무방하다는 trade-off. 만약 영구 기록이 필요하면 별도 persistent store가 필요 (현재 범위 밖).
+제거된 source의 `total` 카운트는 사라집니다. 5분간 활동 없는 source의 누적은 잊어도 무방하다는 trade-off. 만약 영구 기록이 필요하면 별도 persistent store가 필요 (현재 범위 밖).
 
 ---
 
@@ -437,14 +514,14 @@ main.cpp: alerts 출력 안 함
 ```
 공격자 MAC AA:BB:CC가 ch 11에서 1초에 10번 deauth 송신 (reason=7)
 t=0~1초: 10개 들어옴 (모두 ch=11, reason=7)
-  per-source MacAA의 recent=[t1..t10], count=10 >= perSourceInfo(5)
+  per-source MacAA의 recent=[t1..t10], count=10 >= perSource.info(5)
   → severity=info, 첫 alert이라 즉시 발사
   → "deauth from AA:BB:CC: 10 events in last 10000ms (total=10, latest: ch=11, reason=7)"
 t=1~2초: 또 10개
-  count=20 >= perSourceWarn(10) → severity=warn
+  count=20 >= perSource.warn(10) → severity=warn
   escalation (info → warn), cooldown 무시 → 즉시 발사
 t=2~3초: 또 10개
-  count=30 > perSourceCritical(20) → severity=critical
+  count=30 > perSource.critical(20) → severity=critical
   escalation (warn → critical), 즉시 발사
 ```
 
@@ -454,7 +531,7 @@ t=2~3초: 또 10개
 ```
 공격자가 5개 MAC을 번갈아 spoofing, 초당 20번, 모두 ch=6
 per-source 카운터: 각 MAC은 분당 4번 → 임계치 미달
-전역 카운터 (ch=6): 초당 20번, 10초면 200번 → globalCritical(40) 훌쩍 넘김
+전역 카운터 (ch=6): 초당 20번, 10초면 200번 → global.critical(40) 훌쩍 넘김
   → ch=6 전역 critical alert 발사
   → "global deauth flood: 200 events in last 10000ms (latest: ch=6)"
 ```
@@ -477,7 +554,7 @@ t=1   : ch=6 에서 별도 attacker가 15개 deauth
   → sources_[MacZ]에 entry 생성, total=100, lastSeen=0
 공격자 사라짐, 평화로움
 t=300초 (5분 후), 다른 누군가 deauth 보냄 → observe() 호출
-  → evictIdleSources(now=300) 실행
+  → forgetIdleSources(now=300) 실행
   → MacZ의 recent.empty() && (300 - 0) > 300 (5min) → erase
   → sources_ 맵에서 MacZ 사라짐
 ```
@@ -514,9 +591,9 @@ ChannelHopper 사용 시 detector는 어댑터가 sniff하는 채널의 이벤�
 |---|---|---|
 | Deauth 많이 보는데 alert 없음 | window/threshold 매칭 실패 | `globalCount()` 호출해서 현재 윈도우 카운트 확인 |
 | 한 번만 alert 뜨고 끝 | cooldown 작동 중 | 3초 이상 기다려서 다시 발사되는지 확인 |
-| 메모리 사용량 계속 증가 | eviction 안 됨 | `trackedSources()`로 사이즈 확인. 5분 이상 활성 source가 누적되면 정상 |
+| 메모리 사용량 계속 증가 | 제거 안 됨 | `trackedSources()`로 사이즈 확인. 5분 이상 활성 source가 누적되면 정상 |
 | Same source인데 매번 새 entry | Mac::operator== 오동작 | `statsFor(MacXX)`로 같은 source의 entry가 있는지 확인 |
-| escalation 안 됨 | shouldFire 로직 버그 | severity 전이 시 즉시 alert인지 확인 |
+| escalation 안 됨 | shouldAlert 로직 버그 | severity 전이 시 즉시 alert인지 확인 |
 
 ---
 
@@ -530,7 +607,7 @@ ChannelHopper 사용 시 detector는 어댑터가 sniff하는 채널의 이벤�
 ### 알고리즘 개선
 - **adaptive threshold**: 시간대별 기준 자동 조정 (낮은 트래픽 시간엔 낮은 threshold)
 - **per-channel cooldown**: 채널별 독립 cooldown
-- **persistent stats**: evict된 source도 SQLite 등에 저장해 누적 기록 유지
+- **persistent stats**: 제거된 source도 SQLite 등에 저장해 누적 기록 유지
 
 ### 운영
 - **alert webhook**: Slack/Discord 등으로 알림 전송

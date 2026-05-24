@@ -4,13 +4,13 @@
 #include "channel_hopper.h"
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
 static std::atomic<bool> g_running(true);
 static void on_sigint(int) { g_running.store(false); }
 
-// 여러 capture thread가 std::cout/std::cerr에 동시 출력 시 라인 섞임 방지
 static std::mutex g_outputMtx;
 
 static void usage() {
@@ -23,7 +23,6 @@ static void usage() {
         << "                   <dfs-iface> : 5GHz DFS 전담 (2000ms dwell)\n";
 }
 
-// label=nullptr이면 prefix 생략 (single-adapter 모드)
 static void print_frame(const char* label, const ParsedFrame& f) {
     std::lock_guard<std::mutex> lock(g_outputMtx);
     if (label) std::cout << "[" << label << "]";
@@ -45,13 +44,33 @@ static void print_frame(const char* label, const ParsedFrame& f) {
     std::cout << "\n";
 }
 
-static void print_alert(const Alert& a) {
-    std::lock_guard<std::mutex> lock(g_outputMtx);
-    std::cout << "[ALERT " << toString(a.severity) << "] " << a.message << "\n";
+static std::string format_alert(const Alert& a) {
+    std::ostringstream oss;
+    if (a.scope == AlertScope::global) {
+        oss << "global deauth flood: " << a.count
+            << " events in last " << a.window.count() << "ms";
+        if (a.channel.has_value()) oss << " (latest: ch=" << a.channel.value() << ")";
+    } else {
+        oss << "deauth from " << a.source.value().toString()
+            << ": " << a.count << " events in last " << a.window.count() << "ms"
+            << " (total=" << a.total;
+        if (a.channel.has_value())    oss << ", latest: ch=" << a.channel.value();
+        if (a.reasonCode.has_value()) oss << ", reason=" << a.reasonCode.value();
+        oss << ")";
+    }
+    return oss.str();
 }
 
-// 인터페이스를 monitor mode pcap으로 열고, type=mgt BPF 필터를 설정해 반환한다.
-// 실패 시 nullptr 반환 + stderr 진단.
+static void print_alert(const Alert& a) {
+    std::lock_guard<std::mutex> lock(g_outputMtx);
+    std::cout << "[ALERT " << toString(a.severity) << "] " << format_alert(a) << "\n";
+}
+
+static DeauthEvent make_deauth_event(const ParsedFrame& f) {
+    return {std::chrono::steady_clock::now(),
+            f.src, f.dst, f.bssid, f.rssi, f.reasonCode, f.channel};
+}
+
 static pcap_t* open_monitor(const char* ifname) {
     char errbuf[PCAP_ERRBUF_SIZE];
     pcap_t* pcap = pcap_open_live(ifname, 65535, 1, 1, errbuf);
@@ -77,8 +96,6 @@ static pcap_t* open_monitor(const char* ifname) {
     return pcap;
 }
 
-// 한 pcap에서 패킷을 받아 파싱 → 출력 → detector 전달. g_running이 false면 종료.
-// label은 prefix용 (nullptr이면 생략).
 static void capture_loop(pcap_t* pcap, const char* label, DeauthFloodDetector& detector) {
     while (g_running.load()) {
         pcap_pkthdr*   hdr = nullptr;
@@ -102,20 +119,18 @@ static void capture_loop(pcap_t* pcap, const char* label, DeauthFloodDetector& d
         print_frame(label, f);
 
         if (f.frameType == MGMT_SUBTYPE_DEAUTH) {
-            // detector.observe()는 내부 mutex로 thread-safe
-            for (const auto& a : detector.observe(DeauthEvent::from(f))) print_alert(a);
+            for (const auto& a : detector.observe(make_deauth_event(f))) print_alert(a);
         }
     }
 }
 
 struct AdapterSetup {
     const char*      ifname;
-    const char*      label;     // nullptr이면 single-adapter 모드 (prefix 없음)
+    const char*      label;
     ChannelHopConfig cfg;
 };
 
 int main(int argc, char* argv[]) {
-    // ① argv 파싱 → 어댑터 1개 또는 2개로 구성
     std::vector<AdapterSetup> adapters;
     if (argc == 2) {
         adapters.push_back({argv[1], nullptr, ChannelHopConfig{}});
@@ -131,7 +146,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // ② 모든 어댑터 pcap 오픈 — 하나라도 실패하면 cleanup 후 종료
     std::vector<pcap_t*> pcaps;
     for (const auto& a : adapters) {
         pcap_t* p = open_monitor(a.ifname);
@@ -145,7 +159,6 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  on_sigint);
     std::signal(SIGTERM, on_sigint);
 
-    // ③ detector + hopper 준비 (ChannelHopper는 mutex/thread를 가져 non-movable → unique_ptr)
     DeauthFloodDetector detector;
     std::vector<std::unique_ptr<ChannelHopper>> hoppers;
     for (const auto& a : adapters) {
@@ -153,7 +166,6 @@ int main(int argc, char* argv[]) {
         hoppers.back()->start();
     }
 
-    // ④ 배너
     std::cout << "[*] mode          : "
               << (adapters.size() == 1 ? "single-adapter" : "dual-adapter") << "\n";
     for (size_t i = 0; i < adapters.size(); ++i) {
@@ -166,7 +178,6 @@ int main(int argc, char* argv[]) {
                                        " 5/10/20 per-source)\n"
               << "[*] 802.11 management frame 캡처 시작 ... (Ctrl+C to stop)\n";
 
-    // ⑤ 어댑터별 capture thread 스폰. 공유 detector + 출력 mutex로 직렬화.
     std::vector<std::thread> threads;
     threads.reserve(adapters.size());
     for (size_t i = 0; i < adapters.size(); ++i) {
@@ -177,7 +188,6 @@ int main(int argc, char* argv[]) {
 
     for (auto& t : threads) t.join();
 
-    // ⑥ cleanup
     std::cout << "\n[*] stopping ...\n";
     for (auto& h : hoppers) h->stop();
     for (auto* p : pcaps)   pcap_close(p);

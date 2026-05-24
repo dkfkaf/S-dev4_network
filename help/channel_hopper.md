@@ -1,6 +1,6 @@
 # ChannelHopper 코드 설명
 
-`include/channel_hopper.h` + `src/channel_hopper.cpp` 의 동작과 설계를 풀어 쓴 문서.
+`include/hopper/channel_hopper.h` + `src/hopper/channel_hopper.cpp` 의 동작과 설계를 풀어 쓴 문서.
 
 ---
 
@@ -27,7 +27,7 @@ hopper.stop();
   - `mon0` (fast): `fastNonDfs()` — 11채널 200ms (빠른 sweep)
   - `mon1` (dfs):  `dfsOnly()`    — 12 DFS 채널 2000ms (DFS CAC 비용 amortize)
   
-duel-adapter에서 두 ChannelHopper 인스턴스가 독립적으로 동작하고, **DeauthFloodDetector는 thread-safe하게 공유**되어 통합 통계를 유지합니다.
+dual-adapter에서 두 ChannelHopper 인스턴스가 독립적으로 동작하고, **DeauthFloodDetector는 thread-safe하게 공유**되어 통합 통계를 유지합니다. (실제 main.cpp는 non-movable한 ChannelHopper를 vector에 담기 위해 `std::vector<std::unique_ptr<ChannelHopper>>`로 관리)
 
 ---
 
@@ -68,12 +68,18 @@ duel-adapter에서 두 ChannelHopper 인스턴스가 독립적으로 동작하�
 
 ```cpp
 struct ChannelHopConfig {
-    std::vector<int>          channels = {1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161};
+    // 채널 리스트 상수 — default + factory 공유 (DRY)
+    inline static const std::vector<int> NON_DFS_CHANNELS = {
+        1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161};
+    inline static const std::vector<int> DFS_CHANNELS = {
+        52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140};
+
+    std::vector<int>          channels = NON_DFS_CHANNELS;
     std::chrono::milliseconds dwell    = std::chrono::milliseconds(500);
 
     // 듀얼 어댑터 운용용 preset
-    static ChannelHopConfig fastNonDfs();   // 11채널, 200ms dwell
-    static ChannelHopConfig dfsOnly();      // 12채널 (DFS), 2000ms dwell
+    static ChannelHopConfig fastNonDfs();   // NON_DFS_CHANNELS, 200ms dwell
+    static ChannelHopConfig dfsOnly();      // DFS_CHANNELS, 2000ms dwell
 };
 ```
 
@@ -83,7 +89,7 @@ struct ChannelHopConfig {
 - **5GHz UNII-1** (36, 40, 44, 48): DFS가 아닌 5GHz 저대역
 - **5GHz UNII-3** (149, 153, 157, 161): DFS가 아닌 5GHz 고대역
 
-**DFS 채널(52~144)은 일부러 제외**했습니다. DFS는 "Dynamic Frequency Selection"으로, 레이더 감지를 위해 채널 진입 직후 일정 시간 passive (송신 금지, 수신만)이 강제됩니다. monitor mode에서도 진입 후 잠시 패킷이 안 보일 수 있어 캡처 효율이 떨어집니다.
+**기본 single-adapter 구성과 `fastNonDfs()` preset에서는 DFS 채널(52~144)을 제외**합니다. DFS는 "Dynamic Frequency Selection"으로, 레이더 감지를 위해 채널 진입 직후 일정 시간 passive (송신 금지, 수신만)이 강제됩니다. monitor mode에서도 진입 후 잠시 패킷이 안 보일 수 있어 짧은 dwell로 빠르게 sweep하는 경로에는 부적합 — 그래서 빠른 경로에선 빼두고, 듀얼 어댑터 운용 시 별도 인터페이스에서 `dfsOnly()` preset (DFS 12채널, 2000ms dwell)으로 전담 sniff하여 CAC 비용을 amortize 합니다.
 
 ### `dwell` — 각 채널에서 얼마나 머물지
 기본 500ms. 너무 짧으면 비콘(보통 100ms 주기) 한두 개도 못 보고 떠나고, 너무 길면 다른 채널의 공격을 놓칠 수 있습니다. 500ms면 채널당 비콘 5개 정도 보고 떠나는 수준.
@@ -95,15 +101,17 @@ struct ChannelHopConfig {
 
 ```cpp
 ChannelHopConfig::fastNonDfs() {
-    return {{1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161},   // 11채널
-            std::chrono::milliseconds(200)};                    // 짧은 dwell
+    return {NON_DFS_CHANNELS,                  // 11채널 (default와 동일 리스트)
+            std::chrono::milliseconds(200)};   // 짧은 dwell
 }
 
 ChannelHopConfig::dfsOnly() {
-    return {{52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140},   // 12 DFS 채널
-            std::chrono::milliseconds(2000)};                            // 긴 dwell
+    return {DFS_CHANNELS,                      // 12 DFS 채널
+            std::chrono::milliseconds(2000)};  // 긴 dwell
 }
 ```
+
+채널 리스트가 **각 preset에 박혀있던 hardcoded array → `NON_DFS_CHANNELS`/`DFS_CHANNELS` 상수 참조**로 바뀌어 한 곳에서 관리됨. default(`ChannelHopConfig{}`)와 `fastNonDfs()`가 같은 NON_DFS 리스트를 공유한다는 사실이 코드에 명시.
 
 **왜 이런 분담?**
 - `fastNonDfs`: non-DFS 채널은 진입 비용이 작아 짧은 dwell로 빠른 sweep 가능. 200ms × 11 = 2.2초 cycle
@@ -213,8 +221,8 @@ bool ChannelHopper::setChannel(int channel) {
     if (pid < 0) return false;
 
     if (pid == 0) {
-        ::execlp("iw", "iw", "dev", iface_.c_str(),
-                 "set", "channel", chBuf, (char*)nullptr); // ③ 자식에서 iw 실행
+        ::execlp("iw", "iw", "dev", iface_.c_str(), "set", "channel", chBuf,
+                 static_cast<char*>(nullptr));              // ③ 자식에서 iw 실행
         ::_exit(127);                                       // ④ exec 실패 시 종료
     }
 
@@ -236,6 +244,7 @@ bool ChannelHopper::setChannel(int channel) {
 `execlp("iw", "iw", "dev", ifname, "set", "channel", "11", nullptr)` 은 자식 프로세스의 메모리를 **`iw` 명령 실행 코드로 통째로 교체**합니다. `iw`가 채널 변경을 수행하고 종료합니다.
 
 - 왜 `system("iw ...")` 안 쓰나? `system()`은 shell을 거치므로 인터페이스 이름에 `;` 같은 게 끼면 명령어 주입(shell injection) 가능. `execlp`는 인자를 그대로 넘기므로 안전.
+- 마지막 인자의 `static_cast<char*>(nullptr)`는 variadic 함수에서 sentinel을 명시적으로 `char*`로 캐스팅 — 일부 플랫폼에서 `nullptr`만 넘기면 `int 0`으로 해석되어 ABI 차이가 생길 수 있기 때문.
 
 **④ _exit(127) — execlp 실패 시 종료**
 `iw`가 시스템에 없으면 `execlp`가 실패하고 그 다음 줄로 진행됩니다. `_exit(127)` 은 자식 프로세스를 즉시 종료. 127은 관례적으로 "command not found" 의미.
@@ -260,10 +269,19 @@ std::string ChannelHopper::summary() const;
 // 출력 예: "2.4GHz(1,6,11) + 5GHz(36,40,44,48,149,153,157,161) — 500ms dwell"
 ```
 
-채널을 2.4GHz/5GHz로 자동 분류(`ch <= 14` 휴리스틱)하여 사람이 읽기 좋게 출력. main.cpp의 시작 배너에서 사용:
+채널을 2.4GHz/5GHz로 자동 분류(`ch <= 14` 휴리스틱)하여 사람이 읽기 좋게 출력. main.cpp의 시작 배너에서 인터페이스 이름과 함께 한 줄로 출력:
 
 ```cpp
-std::cout << "[*] channel hop   : " << hopper.summary() << "\n";
+std::cout << "[*] ";
+if (adapters[i].label) std::cout << adapters[i].label << "-iface : ";
+else                   std::cout << "interface     : ";
+std::cout << adapters[i].ifname << " — " << hoppers[i]->summary() << "\n";
+```
+
+출력 예 (dual-adapter):
+```
+[*] fast-iface : mon0 — 2.4GHz(1,6,11) + 5GHz(36,40,44,48,149,153,157,161) — 200ms dwell
+[*] dfs-iface  : mon1 — 5GHz(52,56,60,64,100,104,108,112,116,132,136,140) — 2000ms dwell
 ```
 
 ---
