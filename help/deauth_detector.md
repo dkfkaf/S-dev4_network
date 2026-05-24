@@ -177,14 +177,14 @@ struct CooldownState {
 struct DeauthSourceStats {
     Window         recent;        // 최근 윈도우 내 timestamp들
     uint64_t       total = 0;     // 누적 카운트 (모든 시간)
-    TimePoint      lastSeen;      // 마지막 발생 시각
+    TimePoint      lastDeauthSeen;      // 마지막 발생 시각
     CooldownState  cd;            // cooldown + escalation 판단용 (자세한 건 §8)
 };
 ```
 
 - `recent`: 그 MAC의 sliding window. 윈도우 밖 timestamp는 `trimWindow()`로 제거됨
 - `total`: 누적 — alert 메시지에 표시 ("이 공격자는 평생 1500번 deauth 보냄" 같은 forensic 정보)
-- `lastSeen`: idle 판단용 (오래 안 보이면 메모리에서 제거)
+- `lastDeauthSeen`: idle 판단용 (오래 안 보이면 메모리에서 제거)
 - `cd`: `CooldownState` 임베드 — 접근은 `stats.cd.lastAlert`, `stats.cd.lastAlertSeverity`
 
 ---
@@ -310,7 +310,7 @@ void DeauthFloodDetector::processPerSourceEvent(const DeauthEvent& event,
     stats.recent.push_back(now);
     trimWindow(stats.recent, cutoff);
     stats.total++;
-    stats.lastSeen = now;
+    stats.lastDeauthSeen = now;
 
     auto sev = severityFor(stats.recent.size(), thresh_.perSource);
     if (!sev.has_value() || !shouldAlert(stats.cd, sev.value(), now)) return;
@@ -461,7 +461,7 @@ void DeauthFloodDetector::forgetIdleSources(TimePoint now) {
 
     for (auto it = sources_.begin(); it != sources_.end(); ) {
         const auto& stats = it->second;
-        if (stats.recent.empty() && (now - stats.lastSeen) > sourceIdleTimeout_) {
+        if (stats.recent.empty() && (now - stats.lastDeauthSeen) > sourceIdleTimeout_) {
             it = sources_.erase(it);
         } else {
             ++it;
@@ -472,7 +472,7 @@ void DeauthFloodDetector::forgetIdleSources(TimePoint now) {
 
 ### 정책
 - **30초마다** 한 번 스캔 (`removalInterval_=30s` 하드코딩, 매 observe()마다 스캔하면 비효율적)
-- `recent`가 비어있고 (윈도우 내 활동 없음) + `lastSeen`이 `sourceIdleTimeout_`(=5분)보다 오래된 source 제거
+- `recent`가 비어있고 (윈도우 내 활동 없음) + `lastDeauthSeen`이 `sourceIdleTimeout_`(=5분)보다 오래된 source 제거
 
 ### 활성 source는 절대 안 지움
 `recent`가 비어있다는 건 윈도우 내 활동 0건 = 사실상 inactive. 활성 공격자는 `recent.size() > 0`이라 안전.
@@ -551,7 +551,7 @@ t=1   : ch=6 에서 별도 attacker가 15개 deauth
 ### 시나리오 D: idle 정리
 ```
 공격자 MacZ가 t=0에 100개 보냄
-  → sources_[MacZ]에 entry 생성, total=100, lastSeen=0
+  → sources_[MacZ]에 entry 생성, total=100, lastDeauthSeen=0
 공격자 사라짐, 평화로움
 t=300초 (5분 후), 다른 누군가 deauth 보냄 → observe() 호출
   → forgetIdleSources(now=300) 실행

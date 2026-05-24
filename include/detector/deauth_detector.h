@@ -29,7 +29,7 @@ struct CooldownState {
 struct DeauthSourceStats {
     Window         recent;
     uint64_t       total = 0;
-    TimePoint      lastSeen;
+    TimePoint      lastDeauthSeen;
     CooldownState  cd;
 };
 

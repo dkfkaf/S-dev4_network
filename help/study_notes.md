@@ -14,7 +14,7 @@
 struct DeauthSourceStats {
     Window         recent;
     uint64_t       total = 0;
-    TimePoint      lastSeen;
+    TimePoint      lastDeauthSeen;
     CooldownState  cd;     // per-source cooldown
 };
 ```
@@ -25,16 +25,16 @@ struct DeauthSourceStats {
 |---|---|---|
 | `recent` | 그 source의 sliding window timestamp들 | 매 deauth마다 push, 오래된 것 trim |
 | `total` | 누적 카운트 (영구) | 매 deauth마다 +1 — *"평생 몇 번 deauth 보냈는지"* |
-| `lastSeen` | 마지막 deauth 시각 | 매 deauth마다 갱신 — `forgetIdleSources`가 idle 판정에 사용 |
+| `lastDeauthSeen` | 마지막 deauth 시각 | 매 deauth마다 갱신 — `forgetIdleSources`가 idle 판정에 사용 |
 | `cd` | 이 source 전용 cooldown 상태 | alert 발사 시 갱신 — 같은 source에 대해 스팸 방지 |
 
 **왜 이 필드들?**
 - `recent`: *"최근 10초 동안 몇 번?"* 답하려고 → sliding window 자료구조
 - `total`: alert 메시지에 *"이 공격자가 평생 1500번 deauth 보냈음"* 같은 forensic 정보 표시
-- `lastSeen`: 메모리 관리용 — 5분 안 보이면 잊기 위해 마지막 본 시각 기록
+- `lastDeauthSeen`: 메모리 관리용 — 5분 안 보이면 잊기 위해 마지막 본 시각 기록
 - `cd`: cooldown은 source별로 독립 (한 source의 cooldown이 다른 source 알람 막으면 안 됨)
 
-**왜 전역(`globalEvents_`)에는 `lastSeen`이 없는가?**
+**왜 전역(`globalEvents_`)에는 `lastDeauthSeen`이 없는가?**
 전역은 모든 source 합산이라 "마지막 봤다" 개념이 무의미. 전역은 절대 forget되지 않음.
 
 ---
@@ -94,7 +94,7 @@ void DeauthFloodDetector::forgetIdleSources(TimePoint now) {
 
     for (auto it = sources_.begin(); it != sources_.end(); ) {
         const auto& stats = it->second;
-        if (stats.recent.empty() && (now - stats.lastSeen) > sourceIdleTimeout_) {
+        if (stats.recent.empty() && (now - stats.lastDeauthSeen) > sourceIdleTimeout_) {
             it = sources_.erase(it);
         } else {
             ++it;
@@ -117,11 +117,11 @@ if (lastRemovalRun_.has_value() &&
 
 **2) Forget 조건**
 ```cpp
-if (stats.recent.empty() && (now - stats.lastSeen) > sourceIdleTimeout_)
+if (stats.recent.empty() && (now - stats.lastDeauthSeen) > sourceIdleTimeout_)
 ```
 **두 조건 모두** 만족해야 제거:
 - `recent.empty()`: 최근 윈도우(10초) 내 활동 0건
-- `lastSeen`이 5분 이상 전
+- `lastDeauthSeen`이 5분 이상 전
 
 활성 공격자는 절대 안 지워짐 — `recent`에 timestamp가 있으니까.
 
