@@ -3,7 +3,7 @@
 #include <sys/wait.h>
 #include <sstream>
 
-/*애도 좀 걸림*/
+
 ChannelHopper::ChannelHopper(std::string iface, ChannelHopConfig cfg)
     : iface_(std::move(iface)), cfg_(std::move(cfg)) {}
 
@@ -21,7 +21,6 @@ void ChannelHopper::start() {
 
 void ChannelHopper::stop() {
     running_.store(false);
-    /*여기서 worker를 왜 깨우는 거지?*/
     stopCv_.notify_all();
     if (worker_.joinable()) worker_.join();
 }
@@ -32,7 +31,6 @@ std::optional<int> ChannelHopper::currentChannel() const {
     return ch;
 }
 
-/*다시 보기*/
 bool ChannelHopper::setChannel(int channel) {
     char chBuf[16];
     std::snprintf(chBuf, sizeof(chBuf), "%d", channel);
@@ -57,8 +55,6 @@ void ChannelHopper::sleepOrUntilStop(std::chrono::milliseconds dur) {
 }
 
 
-/*그냥 채널목록 사람이 보기 편하게 출력해주는 부분*/
-/*애도 어렵다*/
 std::string ChannelHopper::summary() const {
     std::vector<int> ch24, ch5;
     for (int ch : cfg_.channels) {
@@ -90,10 +86,10 @@ void ChannelHopper::run() {
 
     size_t idx = 0;
     while (running_.load()) {
-        size_t scanned = 0;
+        size_t skipcount = 0;
         while (skipped[idx]) {
             idx = (idx + 1) % cfg_.channels.size();
-            if (++scanned >= cfg_.channels.size()) {
+            if (++skipcount >= cfg_.channels.size()) {
                 std::cerr << "[!] 모든 채널 영구 실패 — channel hopping 중단\n";
                 running_.store(false);
                 return;
@@ -118,7 +114,6 @@ void ChannelHopper::run() {
         }
 
         sleepOrUntilStop(cfg_.dwell);
-        /*원형순환하는 건 알겠는데 어떻게 코드에서 돌아가는지는 이해가 안되*/
         idx = (idx + 1) % cfg_.channels.size();
     }
 }

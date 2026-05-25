@@ -13,9 +13,6 @@ using Window = std::deque<TimePoint>;
 struct DeauthEvent {
     TimePoint                ts;
     Mac                      src;
-    Mac                      dst;
-    Mac                      bssid;
-    std::optional<int8_t>    rssi;
     std::optional<uint16_t>  reasonCode;
     std::optional<int>       channel;
 };
@@ -25,7 +22,6 @@ struct CooldownState {
     std::optional<AlertSeverity> lastAlertSeverity;
 };
 
-/*애는 더 공부하기*/
 struct DeauthSourceStats {
     Window         recent;
     uint64_t       total = 0;

@@ -68,7 +68,7 @@ static void print_alert(const Alert& a) {
 
 static DeauthEvent make_deauth_event(const ParsedFrame& f) {
     return {std::chrono::steady_clock::now(),
-            f.src, f.dst, f.bssid, f.rssi, f.reasonCode, f.channel};
+            f.src, f.reasonCode, f.channel};
 }
 
 static pcap_t* open_monitor(const char* ifname) {
