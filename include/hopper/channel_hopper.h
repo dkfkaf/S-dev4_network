@@ -9,6 +9,10 @@
 #include <vector>
 
 struct ChannelHopConfig {
+    inline static const std::vector<int> TWO_FOUR_CHANNELS = {
+        1, 6, 11,
+    };
+
     inline static const std::vector<int> NON_DFS_CHANNELS = {
         1, 6, 11,
         36, 40, 44, 48,
@@ -23,6 +27,9 @@ struct ChannelHopConfig {
     std::vector<int>          channels = NON_DFS_CHANNELS;
     std::chrono::milliseconds dwell    = std::chrono::milliseconds(500);
 
+    static ChannelHopConfig twoFourOnly() {
+        return {TWO_FOUR_CHANNELS, std::chrono::milliseconds(300)};
+    }
     static ChannelHopConfig fastNonDfs() {
         return {NON_DFS_CHANNELS, std::chrono::milliseconds(200)};
     }

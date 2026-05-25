@@ -30,6 +30,16 @@ if(NOT PCAP_INCLUDE_DIR OR NOT PCAP_LIBRARY)
     )
 endif()
 
+find_package(glog QUIET)
+if(NOT glog_FOUND)
+    message(FATAL_ERROR
+        "google-glog not found.\n"
+        "  Ubuntu/Debian : sudo apt install libgoogle-glog-dev\n"
+        "  Fedora/RHEL   : sudo dnf install glog-devel\n"
+        "  Arch          : sudo pacman -S google-glog"
+    )
+endif()
+
 message(STATUS "PCAP include : ${PCAP_INCLUDE_DIR}")
 message(STATUS "PCAP library : ${PCAP_LIBRARY}")
 
@@ -58,6 +68,7 @@ target_include_directories(wips-parser PRIVATE
 target_link_libraries(wips-parser PRIVATE
     ${PCAP_LIBRARY}
     Threads::Threads
+    glog::glog
 )
 
 target_compile_options(wips-parser PRIVATE
