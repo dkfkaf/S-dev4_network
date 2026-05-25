@@ -2,16 +2,14 @@
 #include "mgmt_parser.h"
 #include "deauth_detector.h"
 #include "channel_hopper.h"
+#include "console_log.h"
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <thread>
 #include <vector>
 
 static std::atomic<bool> g_running(true);
 static void on_sigint(int) { g_running.store(false); }
-
-static std::mutex g_outputMtx;
 
 static void usage() {
     std::cout
@@ -21,49 +19,6 @@ static void usage() {
         << "  dual-adapter   : wips-parser mon0 mon1\n"
         << "                   <iface>     : 2.4GHz + 5GHz non-DFS 빠른 sweep (200ms)\n"
         << "                   <dfs-iface> : 5GHz DFS 전담 (2000ms dwell)\n";
-}
-
-static void print_frame(const char* label, const ParsedFrame& f) {
-    std::lock_guard<std::mutex> lock(g_outputMtx);
-    if (label) std::cout << "[" << label << "]";
-    std::cout
-        << "[" << toString(f.frameType) << "]"
-        << "  src="   << f.src.toString()
-        << "  dst="   << f.dst.toString()
-        << "  bssid=" << f.bssid.toString();
-    if (f.ssid.has_value()) {
-        if (f.ssid.value().empty()) std::cout << "  ssid=<hidden>";
-        else                        std::cout << "  ssid=\"" << f.ssid.value() << "\"";
-    }
-    if (f.rssi.has_value())
-        std::cout << "  rssi=" << static_cast<int>(f.rssi.value()) << "dBm";
-    if (f.channel.has_value())
-        std::cout << "  ch=" << f.channel.value();
-    if (f.reasonCode.has_value())
-        std::cout << "  reason=" << f.reasonCode.value();
-    std::cout << "\n";
-}
-
-static std::string format_alert(const Alert& a) {
-    std::ostringstream oss;
-    if (a.scope == AlertScope::global) {
-        oss << "global deauth flood: " << a.count
-            << " events in last " << a.window.count() << "ms";
-        if (a.channel.has_value()) oss << " (latest: ch=" << a.channel.value() << ")";
-    } else {
-        oss << "deauth from " << a.source.value().toString()
-            << ": " << a.count << " events in last " << a.window.count() << "ms"
-            << " (total=" << a.total;
-        if (a.channel.has_value())    oss << ", latest: ch=" << a.channel.value();
-        if (a.reasonCode.has_value()) oss << ", reason=" << a.reasonCode.value();
-        oss << ")";
-    }
-    return oss.str();
-}
-
-static void print_alert(const Alert& a) {
-    std::lock_guard<std::mutex> lock(g_outputMtx);
-    std::cout << "[ALERT " << toString(a.severity) << "] " << format_alert(a) << "\n";
 }
 
 static DeauthEvent make_deauth_event(const ParsedFrame& f) {

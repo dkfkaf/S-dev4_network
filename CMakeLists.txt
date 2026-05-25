@@ -51,6 +51,7 @@ target_include_directories(wips-parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/parser
     ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
     ${CMAKE_CURRENT_SOURCE_DIR}/include/hopper
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/log
     ${PCAP_INCLUDE_DIR}
 )
 
