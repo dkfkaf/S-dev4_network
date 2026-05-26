@@ -16,3 +16,7 @@ void run_startup_diagnostics();
 // `iw dev <iface> info` + `iw phy phyN info`로 어댑터가 실제 지원하는 채널 번호 조회.
 // 실패 시(파싱 불가, iw 미설치 등) 빈 vector — caller가 fallback으로 config 그대로 사용.
 std::vector<int> querySupportedChannels(const std::string& iface);
+
+// `iw phy N info` 출력 문자열에서 지원 채널 추출 — 순수 함수, 테스트 가능.
+// "    * NNNN MHz [CH]" 라인 파싱, "disabled" 표시 채널은 제외.
+std::vector<int> parseChannelsFromIwPhyInfo(const std::string& iwOutput);

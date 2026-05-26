@@ -2,8 +2,6 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
-#include <type_traits>
-#include <variant>
 #include "mac.h"
 
 using TimePoint = std::chrono::steady_clock::time_point;
@@ -26,17 +24,9 @@ inline const char* toString(AlertSeverity s) {
     return "UNKNOWN";
 }
 
-/* 디텍터별 고유 데이터는 Payload 구조체로 분리. Alert 공통 header(severity, timestamp, channel)만
-   고정이고, payload는 std::variant로 합쳐 컴파일 타임에 타입 안전성 확보.
-
-   새 디텍터 추가 절차:
-     1) Payload 구조체 정의 (예: struct EvilTwinPayload { ... };)
-     2) AlertPayload variant에 새 타입 추가
-     3) categoryName()의 if constexpr 분기 추가
-     4) console_log.h::format_alert의 visit 람다에 분기 추가
-
-   variant 기반이라 별도 AlertCategory enum과 동기화 불필요 — payload type 자체가 카테고리. */
-
+// 현재 디텍터가 DeauthFloodDetector 하나뿐 — std::variant<DeauthFloodPayload>는 single-alternative
+// dead complexity였음. payload를 그냥 DeauthFloodPayload로 직접 사용.
+// 향후 Evil Twin 등 추가 시 variant 재도입 또는 다른 polymorphism 메커니즘 결정.
 struct DeauthFloodPayload {
     AlertScope                scope;
     std::optional<Mac>        srcMac;        // perSrcMac: 송신자 MAC (802.11 addr2)
@@ -48,28 +38,13 @@ struct DeauthFloodPayload {
     std::optional<uint16_t>   reasonCode;    // perSrcMac/perBssid: 최근 reason code
 };
 
-// 향후 추가될 payload (지금은 자리표시 주석만):
-// struct EvilTwinPayload { Mac legitBssid; Mac suspectBssid; std::string ssid;
-//                          std::optional<int8_t> suspectRssi; };
-// struct RogueApPayload  { Mac bssid; std::optional<std::string> ssid;
-//                          std::optional<int8_t> rssi; };
-
-using AlertPayload = std::variant<DeauthFloodPayload>;
-
-// 카테고리 이름은 payload variant에서 직접 유도 — enum 동기화 불필요.
-inline const char* categoryName(const AlertPayload& p) {
-    return std::visit([](const auto& v) -> const char* {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, DeauthFloodPayload>) return "deauth_flood";
-        else                                                 return "unknown";
-    }, p);
+inline const char* categoryName(const DeauthFloodPayload&) {
+    return "deauth_flood";
 }
 
-/* Alert — 데이터 전용. 공통 header + payload variant.
-   format_alert(console_log.h)이 std::visit으로 payload 분기. */
+/* Alert — 데이터 전용. 단일 payload type (DeauthFloodPayload). */
 struct Alert {
     AlertSeverity         severity;
-    TimePoint             timestamp;
     std::optional<int>    channel;     // 알림 발생 시점의 채널 컨텍스트 (없을 수도 있음)
-    AlertPayload          payload;
+    DeauthFloodPayload    payload;
 };

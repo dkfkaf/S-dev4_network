@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <cerrno>
 #include <algorithm>
-#include <sstream>
 #include <unordered_set>
 
 namespace {
@@ -160,8 +159,24 @@ void run_startup_diagnostics() {
     LOG(INFO) << "[init] 사전 진단 통과 (root + iw 확인)";
 }
 
-// 어댑터의 실제 지원 채널 조회. `iw phy phyN info`의 "* NNNN MHz [CH]" 라인 파싱.
-// "disabled" 표시된 채널은 제외 (regulatory 차단 등).
+// 순수 파싱 — `iw phy info` 출력에서 채널 번호 추출. I/O 없어 단위 테스트 가능.
+std::vector<int> parseChannelsFromIwPhyInfo(const std::string& iwOutput) {
+    std::vector<int> channels;
+    std::istringstream iss(iwOutput);
+    std::string line;
+    while (std::getline(iss, line)) {
+        // 규제로 막힌 채널은 "disabled" 마킹됨 — 제외.
+        if (line.find("disabled") != std::string::npos) continue;
+        // "    * 2412 MHz [1] (20.0 dBm)" 같은 형식 파싱
+        int freq, ch;
+        if (std::sscanf(line.c_str(), " * %d MHz [%d]", &freq, &ch) == 2) {
+            channels.push_back(ch);
+        }
+    }
+    return channels;
+}
+
+// 어댑터의 실제 지원 채널 조회. I/O 부분 — 위 순수 파서를 호출.
 std::vector<int> querySupportedChannels(const std::string& iface) {
     auto wiphy = findWiphyIndex(iface);
     if (wiphy.empty()) {
@@ -174,18 +189,10 @@ std::vector<int> querySupportedChannels(const std::string& iface) {
         LOG(WARNING) << "[init] " << phyName << " info 조회 실패 — 채널 자동 필터 skip";
         return {};
     }
-
-    std::vector<int> channels;
-    std::istringstream iss(info);
-    std::string line;
-    while (std::getline(iss, line)) {
-        // 규제로 막힌 채널은 "disabled" 마킹됨 — 제외.
-        if (line.find("disabled") != std::string::npos) continue;
-        // "    * 2412 MHz [1] (20.0 dBm)" 같은 형식 파싱
-        int freq, ch;
-        if (std::sscanf(line.c_str(), " * %d MHz [%d]", &freq, &ch) == 2) {
-            channels.push_back(ch);
-        }
+    auto channels = parseChannelsFromIwPhyInfo(info);
+    if (channels.empty()) {
+        LOG(WARNING) << "[init] " << phyName
+                     << " info 파싱 결과 0개 채널 — iw 출력 형식 변경 의심";
     }
     return channels;
 }

@@ -3,7 +3,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,8 +50,6 @@ public:
     bool start();
     void stop();
 
-    std::optional<int> currentChannel() const;
-
     std::string summary() const;
 
 private:
@@ -64,7 +61,6 @@ private:
     ChannelHopConfig          config_;
     std::thread               worker_;
     std::atomic<bool>         running_{false};
-    std::atomic<int>          currentChannel_{-1};
 
     std::mutex                stopMtx_;
     std::condition_variable   stopCv_;

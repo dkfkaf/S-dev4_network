@@ -92,7 +92,9 @@ if(GTest_FOUND)
 
     add_executable(wips-tests
         tests/test_deauth_detector.cpp
+        tests/test_startup.cpp
         src/detector/deauth_detector.cpp
+        src/runtime/startup.cpp
     )
 
     target_include_directories(wips-tests PRIVATE
@@ -100,6 +102,7 @@ if(GTest_FOUND)
         ${CMAKE_CURRENT_SOURCE_DIR}/include/parser
         ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
         ${CMAKE_CURRENT_SOURCE_DIR}/include/log
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/runtime
         ${PCAP_INCLUDE_DIR}
     )
 

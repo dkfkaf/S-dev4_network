@@ -3,8 +3,6 @@
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <type_traits>
-#include <variant>
 
 #include "alert.h"
 #include "mgmt_parser.h"
@@ -67,16 +65,8 @@ inline std::string format_deauth_flood(const Alert& a, const DeauthFloodPayload&
     return oss.str();
 }
 
-/*애는 모르겠는데*/
 inline std::string format_alert(const Alert& a) {
-    return std::visit([&](const auto& payload) -> std::string {
-        using T = std::decay_t<decltype(payload)>;
-        if constexpr (std::is_same_v<T, DeauthFloodPayload>) {
-            return format_deauth_flood(a, payload);
-        } else {
-            return "[unknown alert payload]";
-        }
-    }, a.payload);
+    return format_deauth_flood(a, a.payload);
 }
 
 inline void print_alert(const Alert& a) {

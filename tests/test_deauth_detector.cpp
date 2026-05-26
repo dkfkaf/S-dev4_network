@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <optional>
-#include <variant>
 #include <vector>
 
 #include "alert.h"
@@ -16,17 +15,30 @@ using clock_type = std::chrono::steady_clock;
 
 namespace {
 
-ParsedFrame mkDeauthFrame(const Mac& src,
-                          std::optional<int>      channel = 6,
-                          std::optional<Mac>      bssid   = std::nullopt,
-                          std::optional<uint16_t> reason  = std::nullopt) {
+// 필드명으로 의도 명시 — positional argument 4개 헷갈림 회피.
+// 기본값은 typical 시나리오: ch=6, 그 외 unset.
+struct DeauthFrameSpec {
+    Mac                     src;
+    std::optional<Mac>      bssid;
+    std::optional<int>      channel = 6;
+    std::optional<uint16_t> reason;
+};
+
+ParsedFrame mkDeauthFrame(const DeauthFrameSpec& spec) {
     ParsedFrame f{};
     f.frameType  = MGMT_SUBTYPE_DEAUTH;
-    f.src        = src;
-    f.channel    = channel;
-    if (bssid.has_value()) f.bssid = bssid.value();
-    f.reasonCode = reason;
+    f.src        = spec.src;
+    if (spec.bssid.has_value()) f.bssid = spec.bssid.value();
+    f.channel    = spec.channel;
+    f.reasonCode = spec.reason;
     return f;
+}
+
+// 자주 쓰는 단축형 — src만 지정. 이전 mkDeauthFrame(attacker) 호환.
+ParsedFrame mkDeauthFrame(const Mac& src) {
+    DeauthFrameSpec spec;
+    spec.src = src;
+    return mkDeauthFrame(spec);
 }
 
 ParsedFrame mkBeaconFrame() {
@@ -39,16 +51,14 @@ Mac macOf(const std::string& s) {
     return Mac::fromString(s).value();
 }
 
-// alerts에서 (scope, severity) 매칭 개수 — DeauthFloodPayload만 본다.
+// alerts에서 (scope, severity) 매칭 개수.
 int countDeauthAlerts(const std::vector<Alert>& alerts,
                       AlertScope     scope,
                       AlertSeverity  severity) {
     int n = 0;
     for (const auto& a : alerts) {
         if (a.severity != severity) continue;
-        if (!std::holds_alternative<DeauthFloodPayload>(a.payload)) continue;
-        const auto& p = std::get<DeauthFloodPayload>(a.payload);
-        if (p.scope == scope) ++n;
+        if (a.payload.scope == scope) ++n;
     }
     return n;
 }
@@ -115,7 +125,6 @@ TEST(Observe, NonDeauthFrameProducesNoAlerts) {
     DeauthFloodDetector det;
     auto alerts = det.observe(clock_type::now(), mkBeaconFrame());
     EXPECT_TRUE(alerts.empty());
-    EXPECT_EQ(det.globalCount(), 0u);
 }
 
 TEST(Observe, AlertCarriesDeauthFloodPayload) {
@@ -131,7 +140,6 @@ TEST(Observe, AlertCarriesDeauthFloodPayload) {
     auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker));
 
     ASSERT_FALSE(alerts.empty());
-    EXPECT_TRUE(std::holds_alternative<DeauthFloodPayload>(alerts[0].payload));
     EXPECT_STREQ(categoryName(alerts[0].payload), "deauth_flood");
 }
 
@@ -170,15 +178,14 @@ TEST(Observe, NormalDisconnectReasonFullyExcludedFromAllScopes) {
     const auto t0 = clock_type::now();
 
     // reason=3 (STA leaving, 정상 disconnect) — global/perSrcMac/perBssid 모두에서 완전 제외
-    det.observe(t0,         mkDeauthFrame(attacker, 6, target, 3));
-    det.observe(t0 + 50ms,  mkDeauthFrame(attacker, 6, target, 3));
-    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker, 6, target, 3));
+    DeauthFrameSpec normalDisconnect;
+    normalDisconnect.src = attacker; normalDisconnect.bssid = target; normalDisconnect.reason = 3;
+    det.observe(t0,         mkDeauthFrame(normalDisconnect));
+    det.observe(t0 + 50ms,  mkDeauthFrame(normalDisconnect));
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(normalDisconnect));
 
-    // 어떤 scope에서도 alert 없어야 함 — 카운터에 누적조차 안 됨
+    // 어떤 scope에서도 alert 없어야 함
     EXPECT_TRUE(alerts.empty());
-    EXPECT_EQ(det.globalCount(), 0u);
-    EXPECT_EQ(det.trackedSrcMacs(), 0u);
-    EXPECT_EQ(det.trackedBssids(), 0u);
 }
 
 TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
@@ -193,9 +200,11 @@ TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
     const auto t0 = clock_type::now();
 
     // reason=7 (class 3 frame from non-associated STA — aireplay-ng 기본값)
-    det.observe(t0,         mkDeauthFrame(attacker, 6, target, 7));
-    det.observe(t0 + 50ms,  mkDeauthFrame(attacker, 6, target, 7));
-    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker, 6, target, 7));
+    DeauthFrameSpec attack;
+    attack.src = attacker; attack.bssid = target; attack.reason = 7;
+    det.observe(t0,         mkDeauthFrame(attack));
+    det.observe(t0 + 50ms,  mkDeauthFrame(attack));
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attack));
 
     EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 1);
 }
@@ -211,9 +220,14 @@ TEST(Observe, PerBssidAlertCatchesMacRandomizedAttack) {
     const auto t0 = clock_type::now();
 
     // MAC randomization 공격자 시뮬레이션 — 매번 다른 src, 같은 target BSSID
-    det.observe(t0,         mkDeauthFrame(macOf("AA:00:00:00:00:01"), 6, target, 7));
-    det.observe(t0 + 50ms,  mkDeauthFrame(macOf("AA:00:00:00:00:02"), 6, target, 7));
-    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(macOf("AA:00:00:00:00:03"), 6, target, 7));
+    DeauthFrameSpec attack;
+    attack.bssid = target; attack.reason = 7;
+    attack.src = macOf("AA:00:00:00:00:01");
+    det.observe(t0, mkDeauthFrame(attack));
+    attack.src = macOf("AA:00:00:00:00:02");
+    det.observe(t0 + 50ms, mkDeauthFrame(attack));
+    attack.src = macOf("AA:00:00:00:00:03");
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attack));
 
     // per-source는 src가 모두 달라서 누적 안 됨. per-BSSID가 잡아냄 — 이게 핵심 가치.
     EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 0);

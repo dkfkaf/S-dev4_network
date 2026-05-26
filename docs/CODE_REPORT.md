@@ -255,7 +255,7 @@ bool isNormalDisconnect(std::optional<uint16_t> reason) {
 
 ### B. `src/hopper/channel_hopper.cpp`
 
-채널 호퍼 — 인터페이스의 채널을 주기적으로 바꿔 전 대역 스캔. `iw` 외부 명령을 fork/exec로 호출하고, 실패 시 채널별 지수 재시도 지연으로 재시도.
+채널 호퍼 — 인터페이스의 채널을 주기적으로 바꿔 전 대역 스캔. `iw` 외부 명령을 fork/exec로 호출. 미지원 채널은 startup의 capability 필터에서 사전 제거됨.
 
 #### 구조 개관
 
@@ -274,45 +274,29 @@ bool isNormalDisconnect(std::optional<uint16_t> reason) {
 
 7. summary()                         "2.4GHz(1,6,11) + 5GHz(36,...) — 500ms dwell" 형식
 
-8. run()                             worker thread 본체 — 메인 루프
+8. run()                             worker thread 본체 — 단순 순환 루프
 ```
 
-#### run() — 메인 루프
+#### run() — 단순 순환 루프
 
 ```cpp
 void ChannelHopper::run() {
-    // 채널별 상태: failures 카운터 + skipUntil(재시도 지연 만료 시각)
-    struct ChState { int failures; std::optional<TimePoint> skipUntil; };
-    std::vector<ChState> state(config_.channels.size());
-    
-    // 지수 재시도 지연 계산
-    auto computeRetryDelay = [&](int n) { ... };
-    
     size_t idx = 0;
     while (running_.load()) {
-        // 1) 현재 idx가 지연 중이면 ready 채널로 jump
-        //    (모두 지연 중이면 가장 이른 만료까지 sleep)
-        if (state[idx].skipUntil.has_value() && now < state[idx].skipUntil.value()) {
-            // ready 찾기 또는 sleep 후 continue
-        }
-        
-        // 2) 채널 변경 시도
-        if (setChannel(config_.channels[idx])) {
+        const int ch = config_.channels[idx];
+        if (setChannel(ch)) {
             currentChannel_.store(ch);
-            state[idx] = {};  // failures reset
         } else {
-            state[idx].failures++;
-            state[idx].skipUntil = now + computeRetryDelay(state[idx].failures);
+            currentChannel_.store(-1);
+            LOG(WARNING) << "[hopper] 채널 " << ch << " 변경 실패 — 다음 cycle에 자동 재시도";
         }
-        
-        // 3) dwell time 대기
         sleepOrUntilStop(config_.dwell);
         idx = (idx + 1) % config_.channels.size();
     }
 }
 ```
 
-**지수 재시도 지연**: 1초 → 2초 → 4초 → ... → 5분 cap. 일시 장애 후 복구되면 카운터 reset해서 정상 순환에 즉시 복귀. 이전 버전은 3회 실패 시 영구 skip이었는데 그건 채널이 영영 사라지는 문제 있어서 변경.
+**과거의 복잡한 retry 로직 제거**: 이전엔 채널별 failure 카운터 + 지수 retry delay (1s → 2s → ... → 5분 cap) + "모두 지연 중" sleep 처리가 있었음. 이유는 미지원 채널을 영구 skip 안 하면서도 일시 장애 복구 허용. 현재는 startup의 `querySupportedChannels`가 미지원 채널을 사전 제거하므로, 여기 도달하는 채널은 모두 지원. 일시 실패는 단순히 다음 cycle에 재시도하면 충분 — 별도 state 관리 불필요.
 
 #### setChannel() — fork + execlp + errPipe
 
@@ -542,7 +526,7 @@ threads.emplace_back([&, i] {
 [ iw dev mon0 set channel N ]
        │
        │  실패 시 errPipe로 stderr 캡처 → LOG
-       │  실패 시 채널 재시도 지연 적용
+       │  실패 시 currentChannel = -1, 다음 cycle에 재시도
        ▼
 [ wireless driver ]
 ```
@@ -557,7 +541,7 @@ main thread는 `wait_for_shutdown_signal()`에서 SIGINT 받을 때까지 잠들
 |---|---|
 | 캡처는 되는데 alert 안 뜸 | `deauth_detector.cpp::observe` — frame.reasonCode가 3/8이면 perSrcMac/perBssid 필터됨. global 임계치(50)에도 못 미치는지 확인 |
 | Alert이 한 번 뜨고 멈춤 | `deauth_detector.cpp::shouldAlert` — cooldown 3초 작동 중. escalation까지 가야 다시 발사 |
-| 채널이 한 곳에 멈춰 있음 | `channel_hopper.cpp::run` — 모든 채널 재시도 지연 가능성. WARNING 로그 `[hopper] 모든 채널 재시도 지연 중` 확인 |
+| 채널이 한 곳에 멈춰 있음 | `channel_hopper.cpp::run` 단순 순환. setChannel 반복 실패 의심 — WARNING 로그 `[hopper] 채널 N 변경 실패` 빈도 확인 |
 | `iw` 실패하는데 이유 모름 | `channel_hopper.cpp::setChannel` — errPipe로 캡처된 stderr가 LOG(ERROR)로 나옴 |
 | 시작 시 LOG(FATAL) | `startup.cpp::run_startup_diagnostics` — root 권한 또는 iw 미설치 |
 | Ctrl+C 안 먹힘 | `main.cpp::on_sigint` + `wait_for_shutdown_signal` — pipe 생성 실패했는지 확인 |

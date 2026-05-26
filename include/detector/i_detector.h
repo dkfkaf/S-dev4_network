@@ -12,13 +12,10 @@
      동일 frame을 본 모든 디텍터의 시간선이 일치하도록.
    - observe()는 stateful해도 됨 (sliding window, BSSID 추적 등).
    - 멀티 캡처 스레드(듀얼 어댑터)가 동시 호출 가능 — 구현체가 thread-safe 보장.
-   - name()은 로그/메트릭 식별자 — 짧은 snake_case 권장 (e.g. "deauth_flood").
-   virtual을 쓴 것은 이후 코드들을 붙여서 쓰기 위해 */
+   - virtual을 쓴 것은 이후 디텍터(Evil Twin 등) 추가 시 같은 dispatcher가 호출하기 위함. */
 class IDetector {
 public:
     virtual ~IDetector() = default;
-
-    virtual const char* name() const = 0;
 
     virtual std::vector<Alert> observe(TimePoint timestamp, const ParsedFrame& frame) = 0;
 };

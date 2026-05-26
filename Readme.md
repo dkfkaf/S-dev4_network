@@ -41,7 +41,7 @@
 - 설정 가능한 채널 목록 + dwell time
 - **2.4GHz + 5GHz non-DFS** 기본 (DFS 채널은 별도 어댑터 권장)
 - 채널 변경: `iw dev <iface> set channel <n>` 를 `fork`/`execlp` 로 안전 호출 (shell injection 방지)
-- **채널별 지수 재시도 지연**: 실패 시 1s → 2s → 4s → ... → 5분 cap. 일시 장애 후 복구하면 자동 정상 순환 복귀 (영구 skip 아님).
+- **단순 순환 (실패는 다음 cycle에 재시도)**: 미지원 채널은 startup의 capability 필터(`iw phy info`)로 사전 제외 — hopper에 도달하는 채널은 모두 지원. 일시 실패는 다음 dwell cycle에 자동 재시도.
 - **듀얼 어댑터 모드**: fast(non-DFS 빠른 sweep) + dfs(DFS 전담, 긴 dwell)
 - **인터럽터블 dwell**: condition_variable로 stop() 호출 시 즉시 깨어남 (shutdown latency < 1ms)
 - **bool 반환**: `start()`가 false면 channel list 비어 silent failure 없이 main에서 즉시 종료
@@ -387,8 +387,7 @@ global 카운터는 모든 deauth 누적 (raw rate 가시성, broadcast 공격 b
 |---|---|
 | `pcap_open_live` 실패 | root 권한 필요. `sudo` 로 실행 |
 | `DLT != IEEE802_11_RADIO` | monitor mode 미설정 |
-| `channel N 변경 실패` 로그 | `iw` 미설치, 어댑터/드라이버 미지원. 재시도 지연(1s → 2s → ... → 5min) 자동 재시도 — 영구 skip 아님 |
-| `모든 채널 재시도 지연 중 — Nms 대기` | 모든 채널이 동시에 지연 중. 가장 이른 만료까지 대기 후 재시도 |
+| `channel N 변경 실패` 로그 | `iw` 일시 거부 또는 일시 장애. 다음 dwell cycle에 자동 재시도. 영구 미지원이면 startup capability 필터에서 사전 제거됨 |
 | 한글이 박스/물음표 (`tofu`) | 터미널 폰트에 CJK 없음 → `sudo apt install fonts-noto-cjk` |
 | 한글이 깨진 라틴 문자 | sudo가 LANG 손실 → `sudo -E` 사용 또는 `sudo LANG=ko_KR.UTF-8` |
 | Deauth는 많은데 alert 없음 | 임계치(perSrcMac 30, perBssid 20)에 못 미치거나 reason=3/8 (정상 disconnect로 분류됨) |

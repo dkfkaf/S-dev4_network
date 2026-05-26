@@ -7,18 +7,45 @@
 #include "deauth_detector.h"
 #include "dot11.h"
 #include <algorithm>
-#include <sstream>
-
-namespace {
 
 // reason 3(STA leaving deauth) / 8(STA leaving disassoc) — 핸드폰 toggle 같은 정상 disconnect.
 // nullopt는 의심으로 간주 (공격자가 reason 안 보낼 수 있음).
-bool isNormalDisconnect(std::optional<uint16_t> reason) {
+bool DeauthFloodDetector::isNormalDisconnect(std::optional<uint16_t> reason) {
     if (!reason.has_value()) return false;
     return reason.value() == 3 || reason.value() == 8;
 }
 
-}  // namespace
+// srcMacStats_/bssidStats_가 동일 타입(map<Mac, DeauthEntryStats>)이라 일반 함수로 공통화.
+// throttle: interval 안 지났으면 skip — 매 observe()마다 전체 스캔 방지.
+void DeauthFloodDetector::forgetIdleEntries(std::map<Mac, DeauthEntryStats>& m,
+                                            std::optional<TimePoint>&        lastRun,
+                                            TimePoint                        now,
+                                            std::chrono::milliseconds        interval,
+                                            std::chrono::milliseconds        idleTimeout) {
+    if (lastRun.has_value() && (now - lastRun.value()) < interval) return;
+    lastRun = now;
+    for (auto it = m.begin(); it != m.end(); ) {
+        if (it->second.recent.empty() && (now - it->second.lastDeauthSeen) > idleTimeout) {
+            it = m.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// perSrcMac/perBssid 둘 다 같은 4줄 업데이트 — 추출.
+void DeauthFloodDetector::updateEntryStats(DeauthEntryStats& stats, TimePoint now, TimePoint cutoff) {
+    stats.recent.push_back(now);
+    trimWindow(stats.recent, cutoff);
+    stats.total++;
+    stats.lastDeauthSeen = now;
+}
+
+// alert 발사 후 cooldown 갱신 — global/perSrcMac/perBssid 셋 다 같은 2줄.
+void DeauthFloodDetector::markAlertFired(CooldownState& state, TimePoint now, AlertSeverity severity) {
+    state.lastAlert         = now;
+    state.lastAlertSeverity = severity;
+}
 
 DeauthFloodDetector::DeauthFloodDetector(DeauthDetectorConfig config)
     : window_(config.window),
@@ -49,52 +76,28 @@ bool DeauthFloodDetector::shouldAlert(const CooldownState& state,
     return (now - state.lastAlert.value()) >= cooldown_;
 }
 
-// 아래 const 조회 메서드들이 mutex_를 잡으므로 mutex_는 mutable.
-// 다단 출력 — caller가 "[*] deauth policy : " (20자) prefix로 첫 줄 시작 후,
-// 연속 줄은 동일 20자 들여쓰기로 정렬되도록 \n + 공백 20개 삽입.
-std::string DeauthFloodDetector::policySummary() const {
-    const auto windowSec = std::chrono::duration_cast<std::chrono::seconds>(window_).count();
-    const auto cooldownSec = std::chrono::duration_cast<std::chrono::seconds>(cooldown_).count();
-    const auto& g = thresh_.globalRate;
-    const auto& s = thresh_.perSrcMac;
-    const auto& b = thresh_.perBssid;
-    const char* indent = "\n                    ";   // 20자 — "[*] deauth policy : "와 정렬
+namespace {
+std::string formatTier(const char* name, const SeverityTier& t) {
     std::ostringstream oss;
-    oss << "window=" << windowSec << "s, cooldown=" << cooldownSec << "s"
-        << indent << "thresholds (info/warn/critical):"
-        << indent << "  globalRate " << g.info << "/" << g.warn << "/" << g.critical
-        << indent << "  perSrcMac  " << s.info << "/" << s.warn << "/" << s.critical
-        << indent << "  perBssid   " << b.info << "/" << b.warn << "/" << b.critical;
+    oss << "  " << name << " " << t.info << "/" << t.warn << "/" << t.critical;
     return oss.str();
 }
+}  // namespace
 
-size_t DeauthFloodDetector::globalCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return globalEvents_.size();
-}
+// 줄 단위 — indent/prefix는 caller가 결정. detector는 자기 데이터만 표현.
+std::vector<std::string> DeauthFloodDetector::policyLines() const {
+    const auto windowSec = std::chrono::duration_cast<std::chrono::seconds>(window_).count();
+    const auto cooldownSec = std::chrono::duration_cast<std::chrono::seconds>(cooldown_).count();
+    std::ostringstream firstLine;
+    firstLine << "window=" << windowSec << "s, cooldown=" << cooldownSec << "s";
 
-size_t DeauthFloodDetector::trackedSrcMacs() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return srcMacStats_.size();
-}
-
-size_t DeauthFloodDetector::trackedBssids() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return bssidStats_.size();
-}
-
-std::optional<DeauthBssidStats> DeauthFloodDetector::bssidStatsFor(const Mac& bssid) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = bssidStats_.find(bssid);
-    if (it == bssidStats_.end()) return std::nullopt;
-    return it->second;
-}
-
-std::optional<DeauthSrcMacStats> DeauthFloodDetector::statsFor(const Mac& src) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = srcMacStats_.find(src);
-    if (it == srcMacStats_.end()) return std::nullopt;
-    return it->second;
+    return {
+        firstLine.str(),
+        "thresholds (info/warn/critical):",
+        formatTier("globalRate", thresh_.globalRate),
+        formatTier("perSrcMac ", thresh_.perSrcMac),
+        formatTier("perBssid  ", thresh_.perBssid),
+    };
 }
 
 /* IDetector 진입점. timestamp는 max(timestamp, 큐 마지막)로 clamp — 듀얼 캡처 스레드 간 시간 역전 방지
@@ -110,9 +113,9 @@ std::vector<Alert> DeauthFloodDetector::observe(TimePoint timestamp, const Parse
         : std::max(timestamp, globalEvents_.back());
 
     // idle entry cleanup은 항상 실행 — 정상 disconnect 기간에도 30초 throttle 내에서 만료.
-    // globalEvents_도 같이 trim해야 globalCount()가 stale 안 됨.
-    forgetIdleSrcMacs(now);
-    forgetIdleBssids(now);
+    // globalEvents_도 같이 trim해야 정상 disconnect 기간에 stale entry 누적 안 됨.
+    forgetIdleEntries(srcMacStats_, lastRemovalRun_,      now, removalInterval_, sourceIdleTimeout_);
+    forgetIdleEntries(bssidStats_,  lastBssidRemovalRun_, now, removalInterval_, sourceIdleTimeout_);
     trimWindow(globalEvents_, now - window_);
 
     // reason 3/8(정상 disconnect)은 카운터 누적 + alert 전부 skip. trade-off: 공격자가 reason=3/8로
@@ -121,53 +124,26 @@ std::vector<Alert> DeauthFloodDetector::observe(TimePoint timestamp, const Parse
 
     const TimePoint cutoff = now - window_;
 
-    processGlobalEvent  (frame, now, cutoff, alerts);
+    processGlobalEvent  (frame, now,         alerts);   // global은 cutoff 안 씀
     processPerSrcMacEvent(frame, now, cutoff, alerts);
     processPerBssidEvent (frame, now, cutoff, alerts);
 
     return alerts;
 }
 
-// idle src 제거 (메모리 관리). throttle: removalInterval 안 지났으면 skip.
-void DeauthFloodDetector::forgetIdleSrcMacs(TimePoint now) {
-    if (lastRemovalRun_.has_value() && (now - lastRemovalRun_.value()) < removalInterval_) return;
-    lastRemovalRun_ = now;
-    for (auto it = srcMacStats_.begin(); it != srcMacStats_.end(); ) {
-        if (it->second.recent.empty() && (now - it->second.lastDeauthSeen) > sourceIdleTimeout_) {
-            it = srcMacStats_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-// idle bssid 제거. forgetIdleSrcMacs와 같은 패턴, 다른 맵/타이머.
-void DeauthFloodDetector::forgetIdleBssids(TimePoint now) {
-    if (lastBssidRemovalRun_.has_value() && (now - lastBssidRemovalRun_.value()) < removalInterval_) return;
-    lastBssidRemovalRun_ = now;
-    for (auto it = bssidStats_.begin(); it != bssidStats_.end(); ) {
-        if (it->second.recent.empty() && (now - it->second.lastDeauthSeen) > sourceIdleTimeout_) {
-            it = bssidStats_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
 
 // 전역 raw rate 누적 + 단일 cooldown (채널별 세분은 perBssid가 담당).
+// trim은 observe()가 이미 했으므로 여기선 push만.
 void DeauthFloodDetector::processGlobalEvent(const ParsedFrame&  frame,
                                              TimePoint           now,
-                                             TimePoint           cutoff,
                                              std::vector<Alert>& alerts) {
     globalEvents_.push_back(now);
-    trimWindow(globalEvents_, cutoff);
 
     auto severity = severityFor(globalEvents_.size(), thresh_.globalRate);
     if (!severity.has_value() || !shouldAlert(globalCooldown_, severity.value(), now)) return;
 
     alerts.push_back(Alert{
         severity.value(),
-        now,
         frame.channel,
         DeauthFloodPayload{
             AlertScope::globalRate,
@@ -178,8 +154,7 @@ void DeauthFloodDetector::processGlobalEvent(const ParsedFrame&  frame,
             std::nullopt,
         },
     });
-    globalCooldown_.lastAlert         = now;
-    globalCooldown_.lastAlertSeverity = severity.value();
+    markAlertFired(globalCooldown_, now, severity.value());
 }
 
 // 송신자(addr2) MAC별 누적. stats는 map 값의 참조 — stats.state 갱신이 곧 srcMacStats_[src].state 갱신.
@@ -188,17 +163,13 @@ void DeauthFloodDetector::processPerSrcMacEvent(const ParsedFrame&  frame,
                                                 TimePoint           cutoff,
                                                 std::vector<Alert>& alerts) {
     DeauthSrcMacStats& stats = srcMacStats_[frame.src];
-    stats.recent.push_back(now);
-    trimWindow(stats.recent, cutoff);
-    stats.total++;
-    stats.lastDeauthSeen = now;
+    updateEntryStats(stats, now, cutoff);
 
     auto severity = severityFor(stats.recent.size(), thresh_.perSrcMac);
     if (!severity.has_value() || !shouldAlert(stats.state, severity.value(), now)) return;
 
     alerts.push_back(Alert{
         severity.value(),
-        now,
         frame.channel,
         DeauthFloodPayload{
             AlertScope::perSrcMac,
@@ -211,8 +182,7 @@ void DeauthFloodDetector::processPerSrcMacEvent(const ParsedFrame&  frame,
             frame.reasonCode,
         },
     });
-    stats.state.lastAlert         = now;
-    stats.state.lastAlertSeverity = severity.value();
+    markAlertFired(stats.state, now, severity.value());
 }
 
 // 표적 BSSID별 누적 — MAC randomization 우회 (attacker가 src를 바꿔도 표적은 고정).
@@ -221,17 +191,13 @@ void DeauthFloodDetector::processPerBssidEvent(const ParsedFrame&  frame,
                                                TimePoint           cutoff,
                                                std::vector<Alert>& alerts) {
     DeauthBssidStats& stats = bssidStats_[frame.bssid];
-    stats.recent.push_back(now);
-    trimWindow(stats.recent, cutoff);
-    stats.total++;
-    stats.lastDeauthSeen = now;
+    updateEntryStats(stats, now, cutoff);
 
     auto severity = severityFor(stats.recent.size(), thresh_.perBssid);
     if (!severity.has_value() || !shouldAlert(stats.state, severity.value(), now)) return;
 
     alerts.push_back(Alert{
         severity.value(),
-        now,
         frame.channel,
         DeauthFloodPayload{
             AlertScope::perBssid,
@@ -244,7 +210,6 @@ void DeauthFloodDetector::processPerBssidEvent(const ParsedFrame&  frame,
             frame.reasonCode,
         },
     });
-    stats.state.lastAlert         = now;
-    stats.state.lastAlertSeverity = severity.value();
+    markAlertFired(stats.state, now, severity.value());
 }
 

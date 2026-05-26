@@ -4,6 +4,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <vector>
 #include "alert.h"
 #include "i_detector.h"
@@ -53,18 +54,12 @@ class DeauthFloodDetector : public IDetector {
 public:
     DeauthFloodDetector(DeauthDetectorConfig config = {});
 
-    const char* name() const override { return "deauth_flood"; }
-
     std::vector<Alert> observe(TimePoint timestamp, const ParsedFrame& frame) override;
 
-    // 운영자 출력용 — 현재 설정된 임계치/윈도우를 한 줄 요약. banner와 진짜 정책의 drift 방지.
-    std::string policySummary() const;
+    // 운영자 출력용 — 현재 설정된 정책을 줄 단위 vector로. caller가 indent prefix 결정.
+    // banner와 진짜 정책의 drift 방지.
+    std::vector<std::string> policyLines() const;
 
-    size_t globalCount() const;
-    size_t trackedSrcMacs() const;
-    size_t trackedBssids() const;
-    std::optional<DeauthSrcMacStats> statsFor(const Mac& srcMac) const;
-    std::optional<DeauthBssidStats>  bssidStatsFor(const Mac& bssid) const;
 
     // 순수 함수 — 단위 테스트가 직접 호출하기 위해 public static.
     static void trimWindow(Window& q, TimePoint cutoff);
@@ -73,15 +68,23 @@ public:
 private:
     bool shouldAlert(const CooldownState& state, AlertSeverity currentSeverity, TimePoint now) const;
 
-    void processGlobalEvent(const ParsedFrame& frame, TimePoint now, TimePoint cutoff,
+    // 송신자 합산은 cutoff 안 씀(observe()에서 이미 trim) — 시그니처 정직화.
+    void processGlobalEvent(const ParsedFrame& frame, TimePoint now,
                             std::vector<Alert>& alerts);
     void processPerSrcMacEvent(const ParsedFrame& frame, TimePoint now, TimePoint cutoff,
                                std::vector<Alert>& alerts);
     void processPerBssidEvent(const ParsedFrame& frame, TimePoint now, TimePoint cutoff,
                               std::vector<Alert>& alerts);
 
-    void forgetIdleSrcMacs(TimePoint now);
-    void forgetIdleBssids(TimePoint now);
+    // 이전엔 anonymous namespace 자유 함수였음 — 의존 방향 정상화(class 내부로) + scope qualifier 제거.
+    static bool isNormalDisconnect(std::optional<uint16_t> reason);
+    static void forgetIdleEntries(std::map<Mac, DeauthEntryStats>& m,
+                                  std::optional<TimePoint>&        lastRun,
+                                  TimePoint                        now,
+                                  std::chrono::milliseconds        interval,
+                                  std::chrono::milliseconds        idleTimeout);
+    static void updateEntryStats(DeauthEntryStats& stats, TimePoint now, TimePoint cutoff);
+    static void markAlertFired(CooldownState& state, TimePoint now, AlertSeverity severity);
 
     std::chrono::milliseconds  window_;
     DeauthThresholds           thresh_;
@@ -89,7 +92,7 @@ private:
     std::chrono::milliseconds  sourceIdleTimeout_;
     std::chrono::milliseconds  removalInterval_;
 
-    mutable std::mutex                                mutex_;
+    std::mutex                                        mutex_;
 
     Window                                            globalEvents_;
     CooldownState                                     globalCooldown_;

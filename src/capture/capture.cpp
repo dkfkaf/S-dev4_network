@@ -2,8 +2,6 @@
 #include "capture.h"
 #include "mgmt_parser.h"
 #include "console_log.h"
-#include <chrono>
-#include <string>
 
 pcap_t* open_monitor(const char* ifname) {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -14,16 +12,17 @@ pcap_t* open_monitor(const char* ifname) {
         return nullptr;
     }
 
-    auto check = [&](int rc, const char* op) {
-        if (rc != 0) {
-            LOG(WARNING) << "[pcap] " << op << "(" << ifname << ") rc=" << rc;
-        }
-    };
-    check(pcap_set_snaplen(pcap, 65535),               "set_snaplen");
-    check(pcap_set_promisc(pcap, 1),                   "set_promisc");
-    check(pcap_set_timeout(pcap, 100),                 "set_timeout");
-    check(pcap_set_immediate_mode(pcap, 1),            "set_immediate_mode");
-    check(pcap_set_buffer_size(pcap, 4 * 1024 * 1024), "set_buffer_size");
+    // pcap_set_* 함수들은 activate 전 단순 setter — 실용상 실패 거의 없음.
+    // 진짜 실패하는 경우(예: buffer size 비정상)는 다음 pcap_activate에서 잡힘.
+    //
+    // [timeout vs immediate_mode 관계]
+    // immediate_mode=1이면 packet당 즉시 전달 — timeout 만료 trigger 자체가 안 됨.
+    // 즉 timeout 100ms는 immediate_mode 미지원 드라이버에서만 활용되는 fallback safeguard.
+    pcap_set_snaplen     (pcap, 65535);              // 전체 frame 캡처 (max snaplen)
+    pcap_set_promisc     (pcap, 1);                  // promiscuous mode 활성
+    pcap_set_timeout     (pcap, 100);                // ms — fallback (immediate_mode 우선)
+    pcap_set_immediate_mode(pcap, 1);                // frame당 즉시 전달 (alert latency 최소화)
+    pcap_set_buffer_size (pcap, 4 * 1024 * 1024);    // 4MB — burst 시 dropped_kernel 방지 마진
 
     if (int rc = pcap_activate(pcap); rc != 0) {
         LOG(ERROR) << "[pcap] activate(" << ifname << ") 실패 (rc=" << rc

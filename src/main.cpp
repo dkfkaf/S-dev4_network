@@ -10,10 +10,8 @@
 #include "startup.h"
 #include <fcntl.h>
 #include <cerrno>
-#include <memory>
 #include <thread>
 #include <unordered_set>
-#include <vector>
 
 static std::atomic<bool> g_running(true);
 static int               g_signal_pipe[2] = {-1, -1};
@@ -130,27 +128,24 @@ int main(int argc, char* argv[]) {
     // 2.4GHz만 지원하는 어댑터에 5GHz 채널 시도해서 매번 실패 로그 띄우는 noise 방지.
     for (auto& a : adapters) {
         auto supported = querySupportedChannels(a.ifname);
-        if (supported.empty()) continue;   // 조회 실패 → config 그대로 사용
-        std::unordered_set<int> supportedSet(supported.begin(), supported.end());
-        std::vector<int> filtered;
-        for (int ch : a.config.channels) {
-            if (supportedSet.count(ch)) filtered.push_back(ch);
+        if (!supported.empty()) {
+            std::unordered_set<int> supportedSet(supported.begin(), supported.end());
+            std::vector<int> filtered;
+            for (int ch : a.config.channels) {
+                if (supportedSet.count(ch)) filtered.push_back(ch);
+            }
+            const size_t before = a.config.channels.size();
+            if (filtered.size() != before) {
+                LOG(INFO) << "[init] iface=" << a.ifname
+                          << " 지원 채널 자동 필터: " << before << "개 → " << filtered.size() << "개"
+                          << " (어댑터 미지원 " << (before - filtered.size()) << "개 제외)";
+            }
+            if (filtered.empty()) {
+                LOG(ERROR) << "[init] iface=" << a.ifname << " 설정 채널 전부 미지원 — 종료";
+                return 1;
+            }
+            a.config.channels = std::move(filtered);
         }
-        const size_t before = a.config.channels.size();
-        const size_t after = filtered.size();
-        if (after != before) {
-            LOG(INFO) << "[init] iface=" << a.ifname
-                      << " 지원 채널 자동 필터: " << before << "개 → " << after << "개"
-                      << " (어댑터 미지원 " << (before - after) << "개 제외)";
-        }
-        if (filtered.empty()) {
-            LOG(ERROR) << "[init] iface=" << a.ifname << " 설정 채널 전부 미지원 — 종료";
-            return 1;
-        }
-        a.config.channels = std::move(filtered);
-    }
-
-    for (const auto& a : adapters) {
         LOG(INFO) << "[init] 어댑터: " << a.ifname
                   << " | 채널 목록: " << a.config.channels.size() << "개";
     }
@@ -163,10 +158,10 @@ int main(int argc, char* argv[]) {
         pcaps.push_back(std::move(p));
     }
 
-    // detector를 typed local로 먼저 받아 policySummary 추출 후 IDetector vector로 이동.
+    // detector를 typed local로 먼저 받아 policy 추출 후 IDetector vector로 이동.
     // 새 디텍터(EvilTwin 등) 추가도 동일 패턴 — concrete 타입에 접근 후 move.
     auto deauthDet = std::make_unique<DeauthFloodDetector>();
-    const std::string deauthPolicy = deauthDet->policySummary();
+    const std::vector<std::string> deauthPolicyLines = deauthDet->policyLines();
 
     std::vector<std::unique_ptr<IDetector>> detectors;
     detectors.push_back(std::move(deauthDet));
@@ -188,8 +183,12 @@ int main(int argc, char* argv[]) {
         else                   std::cout << "interface     : ";
         std::cout << adapters[i].ifname << " — " << hoppers[i]->summary() << "\n";
     }
-    std::cout << "[*] deauth policy : " << deauthPolicy << "\n"
-              << "[*]                 정상 disconnect(reason 3/8)는 모든 카운터에서 완전 제외 (alert 없음)\n"
+    // policy 줄 단위 출력 — 첫 줄은 "deauth policy :" prefix, 이후는 같은 칸 들여쓰기.
+    for (size_t i = 0; i < deauthPolicyLines.size(); ++i) {
+        std::cout << (i == 0 ? "[*] deauth policy : " : "[*]                 ")
+                  << deauthPolicyLines[i] << "\n";
+    }
+    std::cout << "[*]                 정상 disconnect(reason 3/8)는 모든 카운터에서 완전 제외 (alert 없음)\n"
               << "[*] 802.11 management frame 캡처 시작 ... (Ctrl+C to stop)\n";
 
     std::signal(SIGINT,  on_sigint);
