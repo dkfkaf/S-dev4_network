@@ -46,7 +46,9 @@ public:
     ChannelHopper(const ChannelHopper&)            = delete;
     ChannelHopper& operator=(const ChannelHopper&) = delete;
 
-    void start();
+    // 시작 성공 시 true. cfg.channels가 비어 있으면 false (silent failure 방지).
+    // 이미 실행 중이면 true (idempotent).
+    bool start();
     void stop();
 
     std::optional<int> currentChannel() const;

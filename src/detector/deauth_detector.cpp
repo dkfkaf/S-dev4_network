@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "deauth_detector.h"
+#include "dot11.h"
 #include <algorithm>
 
 DeauthFloodDetector::DeauthFloodDetector(std::chrono::milliseconds window,
@@ -11,7 +12,6 @@ DeauthFloodDetector::DeauthFloodDetector(std::chrono::milliseconds window,
       cooldown_(cooldown),
       sourceIdleTimeout_(sourceIdleTimeout) {}
 
-/*애는 다시 볼것*/
 /* trimWindow — deque에서 윈도우 밖(=옛날) timestamp 제거.
    cutoff = "위치"가 아니라 "시간 값" — 윈도우의 가장 오래된 허용 시각 (= now - window_).
    deque는 시간순 정렬 (front=가장 옛날, back=가장 최근).
@@ -67,7 +67,6 @@ void DeauthFloodDetector::forgetIdleSources(TimePoint now) {
     }
 }
 
-/*뮤텍스를 왜 걸었지*/
 /* globalCount / trackedSources / statsFor — 외부 모니터링/디버깅용 스냅샷 조회.
    sources_/globalEvents_는 observe()가 동시 수정 가능한 공유 상태 → 읽기도 락 필수.
    mtx_가 mutable인 이유: const 메서드에서도 락 잡아야 해서. */
@@ -93,13 +92,13 @@ std::optional<DeauthSourceStats> DeauthFloodDetector::statsFor(const Mac& src) c
     return it->second;
 }
 
-/*어려웡 ㅎ*/
-/* observe — detector의 유일한 입력 진입점. 0~2개 alert 반환 (전역 + per-source).
+/* observe — IDetector 인터페이스 진입점. deauth가 아닌 frameType은 즉시 빈 vector.
+   deauth일 때 0~2개 alert 반환 (전역 + per-source).
 
    [Lock] mtx_로 thread-safe 진입. 듀얼 어댑터에서 두 capture thread가 동시 호출 가능.
 
    [시간 거꾸로 가는 거 방지]
-   듀얼 어댑터에서 다른 thread가 이미 더 늦은 ts를 먼저 push 했으면, 이 event의 ts도
+   듀얼 어댑터에서 다른 thread가 이미 더 늦은 ts를 먼저 push 했으면, 이 frame의 ts도
    그 값으로 올려서 deque가 시간 순으로 정렬되게 유지.
    (정렬 깨지면 trimWindow가 잘못 동작 — 앞쪽이 옛날, 뒤쪽이 최신이라고 가정하기 때문)
 
@@ -107,17 +106,19 @@ std::optional<DeauthSourceStats> DeauthFloodDetector::statsFor(const Mac& src) c
      1) processGlobalEvent     — 모든 deauth 통합 카운트 갱신 + 임계치 넘으면 global alert
      2) processPerSourceEvent  — src별 deauth 카운트 갱신 + 임계치 넘으면 per-source alert
      3) forgetIdleSources      — 오래된 src 잊기 (메모리 청소) */
-std::vector<Alert> DeauthFloodDetector::observe(const DeauthEvent& event) {
+std::vector<Alert> DeauthFloodDetector::observe(TimePoint ts, const ParsedFrame& frame) {
+    if (frame.frameType != MGMT_SUBTYPE_DEAUTH) return {};
+
     std::lock_guard<std::mutex> lock(mtx_);
     std::vector<Alert> alerts;
 
     const TimePoint now = globalEvents_.empty()
-        ? event.ts
-        : std::max(event.ts, globalEvents_.back());
+        ? ts
+        : std::max(ts, globalEvents_.back());
     const TimePoint cutoff = now - window_;
 
-    processGlobalEvent(event, now, cutoff, alerts);
-    processPerSourceEvent(event, now, cutoff, alerts);
+    processGlobalEvent(frame, now, cutoff, alerts);
+    processPerSourceEvent(frame, now, cutoff, alerts);
     forgetIdleSources(now);
 
     return alerts;
@@ -133,14 +134,14 @@ std::vector<Alert> DeauthFloodDetector::observe(const DeauthEvent& event) {
    [Cooldown 갱신 — 함수 끝부분]
    gcd.lastAlert/lastAlertSeverity = ... 는 다음 호출의 shouldAlert 판단용.
    이 두 줄 없으면 cooldown이 영원히 작동 안 함 — 매번 첫 alert처럼 발사됨. */
-void DeauthFloodDetector::processGlobalEvent(const DeauthEvent& event,
+void DeauthFloodDetector::processGlobalEvent(const ParsedFrame&  frame,
                                              TimePoint           now,
                                              TimePoint           cutoff,
                                              std::vector<Alert>& alerts) {
     globalEvents_.push_back(now);
     trimWindow(globalEvents_, cutoff);
 
-    const int channelKey = event.channel.value_or(-1);
+    const int channelKey = frame.channel.value_or(-1);
     CooldownState& gcd = globalCooldowns_[channelKey];
 
     auto sev = severityFor(globalEvents_.size(), thresh_.global);
@@ -148,28 +149,30 @@ void DeauthFloodDetector::processGlobalEvent(const DeauthEvent& event,
 
     alerts.push_back(Alert{
         sev.value(),
-        AlertScope::global,
         now,
-        std::nullopt,
-        globalEvents_.size(),
-        window_,
-        event.channel,
-        std::nullopt,
-        0,
+        frame.channel,
+        DeauthFloodPayload{
+            AlertScope::global,
+            std::nullopt,             // source — global이므로 없음
+            globalEvents_.size(),
+            window_,
+            0,                        // total — global은 의미 없음
+            std::nullopt,             // reasonCode — global은 의미 없음
+        },
     });
     gcd.lastAlert         = now;
     gcd.lastAlertSeverity = sev.value();
 }
 
-/* processPerSourceEvent — per-source 차원: event.src별 윈도우/통계 갱신 + 해당 source cooldown 적용한 alert.
+/* processPerSourceEvent — per-source 차원: frame.src별 윈도우/통계 갱신 + 해당 source cooldown 적용한 alert.
 
    processGlobalEvent와 평행 구조 — stats가 맵 안 값의 별칭이라 stats 수정 시
    맵 안 값 직접 변경됨. 끝부분 stats.cd.lastAlert 갱신 안 하면 cooldown 영원히 안 작동. */
-void DeauthFloodDetector::processPerSourceEvent(const DeauthEvent& event,
+void DeauthFloodDetector::processPerSourceEvent(const ParsedFrame&  frame,
                                                 TimePoint           now,
                                                 TimePoint           cutoff,
                                                 std::vector<Alert>& alerts) {
-    DeauthSourceStats& stats = sources_[event.src];
+    DeauthSourceStats& stats = sources_[frame.src];
     stats.recent.push_back(now);
     trimWindow(stats.recent, cutoff);
     stats.total++;
@@ -180,14 +183,16 @@ void DeauthFloodDetector::processPerSourceEvent(const DeauthEvent& event,
 
     alerts.push_back(Alert{
         sev.value(),
-        AlertScope::perSource,
         now,
-        event.src,
-        stats.recent.size(),
-        window_,
-        event.channel,
-        event.reasonCode,
-        stats.total,
+        frame.channel,
+        DeauthFloodPayload{
+            AlertScope::perSource,
+            frame.src,
+            stats.recent.size(),
+            window_,
+            stats.total,
+            frame.reasonCode,
+        },
     });
     stats.cd.lastAlert         = now;
     stats.cd.lastAlertSeverity = sev.value();

@@ -6,16 +6,11 @@
 #include <optional>
 #include <vector>
 #include "alert.h"
+#include "i_detector.h"
 #include "mac.h"
+#include "mgmt_parser.h"
 
 using Window = std::deque<TimePoint>;
-
-struct DeauthEvent {
-    TimePoint                ts;
-    Mac                      src;
-    std::optional<uint16_t>  reasonCode;
-    std::optional<int>       channel;
-};
 
 struct CooldownState {
     std::optional<TimePoint>     lastAlert;
@@ -40,29 +35,31 @@ struct DeauthThresholds {
     SeverityTier perSource = {5, 10, 20};
 };
 
-class DeauthFloodDetector {
+class DeauthFloodDetector : public IDetector {
 public:
     DeauthFloodDetector(std::chrono::milliseconds window            = std::chrono::seconds(10),
                         DeauthThresholds          thresh            = {},
                         std::chrono::milliseconds cooldown          = std::chrono::seconds(3),
                         std::chrono::milliseconds sourceIdleTimeout = std::chrono::minutes(5));
 
-    /*애도 공부하기*/
-    std::vector<Alert> observe(const DeauthEvent& event);
+    const char* name() const override { return "deauth_flood"; }
+
+    std::vector<Alert> observe(TimePoint ts, const ParsedFrame& frame) override;
 
     size_t globalCount() const;
     size_t trackedSources() const;
     std::optional<DeauthSourceStats> statsFor(const Mac& src) const;
 
-private:
+    // 순수 함수 — 단위 테스트가 직접 호출하기 위해 public static.
     static void trimWindow(Window& q, TimePoint cutoff);
     static std::optional<AlertSeverity> severityFor(size_t count, const SeverityTier& tier);
 
+private:
     bool shouldAlert(const CooldownState& cd, AlertSeverity currentSev, TimePoint now) const;
 
-    void processGlobalEvent(const DeauthEvent& event, TimePoint now, TimePoint cutoff,
+    void processGlobalEvent(const ParsedFrame& frame, TimePoint now, TimePoint cutoff,
                             std::vector<Alert>& alerts);
-    void processPerSourceEvent(const DeauthEvent& event, TimePoint now, TimePoint cutoff,
+    void processPerSourceEvent(const ParsedFrame& frame, TimePoint now, TimePoint cutoff,
                                std::vector<Alert>& alerts);
 
     void forgetIdleSources(TimePoint now);

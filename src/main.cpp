@@ -1,18 +1,13 @@
 #include "pch.h"
-#include "mgmt_parser.h"
-#include "deauth_detector.h"
+#include "capture.h"
 #include "channel_hopper.h"
-#include "console_log.h"
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
+#include "deauth_detector.h"
+#include "i_detector.h"
+#include "startup.h"
 #include <fcntl.h>
 #include <cerrno>
-#include <algorithm>
 #include <memory>
-#include <mutex>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 static std::atomic<bool> g_running(true);
@@ -35,219 +30,23 @@ static void wait_for_shutdown_signal() {
     }
 }
 
-static void usage() {
-    std::cout
-        << "syntax : wips-parser [--band 2g|5g|all] [--channels c1,c2,...] <iface> [<dfs-iface>]\n"
-        << "  single-adapter : wips-parser mon0\n"
-        << "                   2.4GHz + 5GHz non-DFS 모든 채널 순환 (500ms dwell)\n"
-        << "  2.4GHz only    : wips-parser --band 2g mon0\n"
-        << "  5GHz only      : wips-parser --band 5g mon0\n"
-        << "  custom         : wips-parser --channels 1,6,11 mon0\n"
-        << "  dual-adapter   : wips-parser mon0 mon1\n"
-        << "                   <iface>     : 2.4GHz + 5GHz non-DFS 빠른 sweep (200ms)\n"
-        << "                   <dfs-iface> : 5GHz DFS 전담 (2000ms dwell)\n";
-}
-
-static DeauthEvent make_deauth_event(const ParsedFrame& f) {
-    return {std::chrono::steady_clock::now(),
-            f.src, f.reasonCode, f.channel};
-}
-
-static pcap_t* open_monitor(const char* ifname) {
-    char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* pcap = pcap_create(ifname, errbuf);
-    if (!pcap) {
-        LOG(ERROR) << "[pcap] pcap_create(" << ifname << ") 실패: " << errbuf
-                   << " — root 권한과 monitor mode 인터페이스를 확인하세요.";
-        return nullptr;
-    }
-
-    auto check = [&](int rc, const char* op) {
-        if (rc != 0) {
-            LOG(WARNING) << "[pcap] " << op << "(" << ifname << ") rc=" << rc;
-        }
-    };
-    check(pcap_set_snaplen(pcap, 65535),               "set_snaplen");
-    check(pcap_set_promisc(pcap, 1),                   "set_promisc");
-    check(pcap_set_timeout(pcap, 100),                 "set_timeout");
-    check(pcap_set_immediate_mode(pcap, 1),            "set_immediate_mode");
-    check(pcap_set_buffer_size(pcap, 4 * 1024 * 1024), "set_buffer_size");
-
-    if (int rc = pcap_activate(pcap); rc != 0) {
-        LOG(ERROR) << "[pcap] activate(" << ifname << ") 실패 (rc=" << rc
-                   << "): " << pcap_geterr(pcap);
-        pcap_close(pcap);
-        return nullptr;
-    }
-    LOG(INFO) << "[pcap] immediate mode 활성화 완료: " << ifname;
-
-    int dlt = pcap_datalink(pcap);
-    if (dlt != DLT_IEEE802_11_RADIO) {
-        LOG(ERROR) << "[pcap] interface '" << ifname
-                   << "' 는 monitor mode (radiotap) 가 아닙니다. DLT=" << dlt;
-        pcap_close(pcap);
-        return nullptr;
-    }
-
-    bpf_program fp;
-    const char* filter = "type mgt and (subtype deauth or subtype disassoc)";
-    if (pcap_compile(pcap, &fp, filter, 1, PCAP_NETMASK_UNKNOWN) == 0) {
-        pcap_setfilter(pcap, &fp);
-        pcap_freecode(&fp);
-        LOG(INFO) << "[pcap] BPF 필터 적용: " << filter;
-    } else {
-        LOG(ERROR) << "[pcap] BPF 컴파일 실패: " << pcap_geterr(pcap);
-    }
-    return pcap;
-}
-
-static void capture_loop(pcap_t* pcap, const char* label, DeauthFloodDetector& detector) {
-    auto lastStats = std::chrono::steady_clock::now();
-
-    while (g_running.load()) {
-        pcap_pkthdr*   hdr = nullptr;
-        const uint8_t* pkt = nullptr;
-        int rc = pcap_next_ex(pcap, &hdr, &pkt);
-
-        if (rc == 0)                continue;
-        if (rc == PCAP_ERROR_BREAK) break;
-        if (rc < 0) {
-            LOG(ERROR) << "[pcap] pcap_next_ex"
-                       << (label ? std::string("(") + label + ")" : std::string())
-                       << " : " << pcap_geterr(pcap);
-            break;
-        }
-
-        auto frame = parse_mgmt_frame(pkt, hdr->caplen);
-        if (frame.has_value()) {
-            const ParsedFrame& f = frame.value();
-            print_frame(label, f);
-
-            if (f.frameType == MGMT_SUBTYPE_DEAUTH) {
-                LOG(WARNING) << "[detect] Deauth 수신 | src=" << f.src.toString()
-                             << " dst=" << f.dst.toString()
-                             << (f.channel.has_value()
-                                    ? " channel=" + std::to_string(f.channel.value())
-                                    : "");
-                for (const auto& a : detector.observe(make_deauth_event(f))) {
-                    LOG(ERROR) << "[alert] " << format_alert(a);
-                    print_alert(a);
-                }
-            }
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStats).count() >= 5) {
-            pcap_stat ps;
-            if (pcap_stats(pcap, &ps) == 0) {
-                LOG(INFO) << "[stats]"
-                          << (label ? std::string("(") + label + ")" : std::string())
-                          << " received=" << ps.ps_recv
-                          << " dropped_kernel=" << ps.ps_drop
-                          << " dropped_iface="  << ps.ps_ifdrop;
-                if (ps.ps_drop > 0) {
-                    LOG(WARNING) << "[stats] kernel drop 발생 — BPF 필터/버퍼 확인 필요";
-                }
-            }
-            lastStats = now;
-        }
-    }
-}
-
 struct AdapterSetup {
     const char*      ifname;
     const char*      label;
     ChannelHopConfig cfg;
 };
 
-static const std::vector<int>& valid_channel_set() {
-    static const std::vector<int> kValid = {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-        36, 40, 44, 48,
-        52, 56, 60, 64,
-        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-        149, 153, 157, 161, 165,
-    };
-    return kValid;
-}
-
-static bool parse_channel_list(const char* csv, std::vector<int>& out) {
-    out.clear();
-    const auto& valid = valid_channel_set();
-    std::unordered_set<int> seen;
-    const char* p = csv;
-    while (*p) {
-        char* end = nullptr;
-        long v = std::strtol(p, &end, 10);
-        if (end == p) return false;
-        const int ch = static_cast<int>(v);
-        if (std::find(valid.begin(), valid.end(), ch) == valid.end()) {
-            LOG(ERROR) << "[init] 알 수 없는 802.11 채널: " << ch;
-            return false;
-        }
-        if (!seen.insert(ch).second) {
-            LOG(ERROR) << "[init] 중복된 채널: " << ch;
-            return false;
-        }
-        out.push_back(ch);
-        p = end;
-        while (*p == ',' || *p == ' ' || *p == '\t') ++p;
-    }
-    return !out.empty();
-}
-
-static bool exec_silent(const char* prog,
-                        std::initializer_list<const char*> args) {
-    pid_t pid = ::fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        int devnull = ::open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            ::dup2(devnull, STDOUT_FILENO);
-            ::dup2(devnull, STDERR_FILENO);
-            ::close(devnull);
-        }
-        std::vector<const char*> argv;
-        argv.reserve(args.size() + 2);
-        argv.push_back(prog);
-        for (const char* a : args) argv.push_back(a);
-        argv.push_back(nullptr);
-        ::execvp(prog, const_cast<char* const*>(argv.data()));
-        ::_exit(127);
-    }
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
-static void run_startup_diagnostics() {
-    if (::geteuid() != 0) {
-        LOG(FATAL) << "[init] root 권한 없음 — sudo로 실행 필요";
-    }
-    if (!exec_silent("iw", {"--version"})) {
-        LOG(FATAL) << "[init] iw 미설치 — sudo apt install iw 후 재시도";
-    }
-    LOG(INFO) << "[init] 사전 진단 통과 (root + iw 확인)";
-}
-
-static void init_log_dir() {
-    const char* path = "/var/log/wips";
-    if (::mkdir(path, 0755) == 0 || errno == EEXIST) {
-        FLAGS_log_dir = path;
-    } else {
-        std::cerr << "[init] " << path << " 사용 불가 ("
-                  << std::generic_category().message(errno)
-                  << ") — stderr 전용 로깅\n";
-    }
-}
+// pcap_t를 unique_ptr로 감싸 자동 close — 모든 exit 경로에서 누수 방지.
+using PcapPtr = std::unique_ptr<pcap_t, decltype(&pcap_close)>;
 
 int main(int argc, char* argv[]) {
-    init_log_dir();
+    // 파일 로깅 가능 여부에 따라 alsologtostderr(파일+stderr) vs logtostderr(stderr only) 선택.
+    // 기존엔 항상 logtostderr=true라 log_dir 설정이 dead code였음.
+    const bool fileLogOk = init_log_dir();
     google::InitGoogleLogging(argv[0]);
-    FLAGS_logtostderr = true;
-    FLAGS_v           = 1;
+    if (fileLogOk) FLAGS_alsologtostderr = true;
+    else           FLAGS_logtostderr     = true;
+    FLAGS_v = 1;
 
     if (::pipe(g_signal_pipe) != 0) {
         LOG(FATAL) << "[init] signal pipe 생성 실패: "
@@ -268,14 +67,14 @@ int main(int argc, char* argv[]) {
             if      (std::strcmp(v, "2g")  == 0) band = BandOpt::twoFour;
             else if (std::strcmp(v, "5g")  == 0) band = BandOpt::five;
             else if (std::strcmp(v, "all") == 0) band = BandOpt::all;
-            else { usage(); return 1; }
+            else { print_usage(); return 1; }
         } else if (std::strcmp(a, "--channels") == 0 && i + 1 < argc) {
             if (!parse_channel_list(argv[++i], customChannels)) {
                 LOG(ERROR) << "[init] --channels 파싱 실패: " << argv[i];
                 return 1;
             }
         } else if (a[0] == '-') {
-            usage();
+            print_usage();
             return 1;
         } else {
             positional.push_back(a);
@@ -310,7 +109,7 @@ int main(int argc, char* argv[]) {
         adapters.push_back({positional[0], "fast", ChannelHopConfig::fastNonDfs()});
         adapters.push_back({positional[1], "dfs",  ChannelHopConfig::dfsOnly()});
     } else {
-        usage();
+        print_usage();
         return 1;
     }
 
@@ -319,21 +118,24 @@ int main(int argc, char* argv[]) {
                   << " | 채널 목록: " << a.cfg.channels.size() << "개";
     }
 
-    std::vector<pcap_t*> pcaps;
+    // pcap 핸들을 RAII로 관리 — return 1 또는 main 종료 시 vector destructor가 자동 pcap_close.
+    std::vector<PcapPtr> pcaps;
     for (const auto& a : adapters) {
-        pcap_t* p = open_monitor(a.ifname);
-        if (!p) {
-            for (auto* x : pcaps) pcap_close(x);
-            return 1;
-        }
-        pcaps.push_back(p);
+        PcapPtr p(open_monitor(a.ifname), &pcap_close);
+        if (!p) return 1;  // 이미 열린 pcaps는 vector 소멸 시 정리됨
+        pcaps.push_back(std::move(p));
     }
 
-    DeauthFloodDetector detector;
+    std::vector<std::unique_ptr<IDetector>> detectors;
+    detectors.push_back(std::make_unique<DeauthFloodDetector>());
+
     std::vector<std::unique_ptr<ChannelHopper>> hoppers;
     for (const auto& a : adapters) {
         hoppers.push_back(std::make_unique<ChannelHopper>(a.ifname, a.cfg));
-        hoppers.back()->start();
+        if (!hoppers.back()->start()) {
+            LOG(ERROR) << "[init] channel hopper 시작 실패 (iface=" << a.ifname << ") — 종료";
+            return 1;  // hoppers/pcaps RAII로 정리됨
+        }
     }
 
     std::cout << "[*] mode          : "
@@ -356,21 +158,24 @@ int main(int argc, char* argv[]) {
     threads.reserve(adapters.size());
     for (size_t i = 0; i < adapters.size(); ++i) {
         threads.emplace_back([&, i] {
-            capture_loop(pcaps[i], adapters[i].label, detector);
+            capture_loop(pcaps[i].get(), adapters[i].label, detectors, g_running);
         });
     }
 
     wait_for_shutdown_signal();
     LOG(INFO) << "[shutdown] 신호 수신 — 종료 시작";
 
-    for (auto* p : pcaps)   pcap_breakloop(p);
-    for (auto& h : hoppers) h->stop();
-    LOG(INFO) << "[shutdown] hopper 정지 완료";
+    // 순서 중요: pcap_breakloop는 non-blocking signal — capture 스레드를 먼저 깨워서 join한다.
+    // hopper.stop()은 iw hang 시 무한 대기 가능 — 그 위험을 capture 종료 경로와 분리하기 위해 뒤에 둔다.
+    for (auto& p : pcaps) pcap_breakloop(p.get());
 
     for (auto& t : threads) t.join();
     LOG(INFO) << "[shutdown] capture 스레드 종료 완료";
 
-    for (auto* p : pcaps) pcap_close(p);
+    for (auto& h : hoppers) h->stop();
+    LOG(INFO) << "[shutdown] hopper 정지 완료";
+
+    pcaps.clear();  // 명시적 해제 — destructor가 pcap_close 호출
     LOG(INFO) << "[shutdown] pcap 핸들 해제 완료";
 
     ::close(g_signal_pipe[0]);

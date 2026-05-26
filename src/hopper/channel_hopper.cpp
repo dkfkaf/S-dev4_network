@@ -10,14 +10,15 @@ ChannelHopper::ChannelHopper(std::string iface, ChannelHopConfig cfg)
 
 ChannelHopper::~ChannelHopper() { stop(); }
 
-void ChannelHopper::start() {
+bool ChannelHopper::start() {
     if (cfg_.channels.empty()) {
         LOG(ERROR) << "[hopper] channel list가 비어있어 channel hopper를 시작하지 않습니다";
-        return;
+        return false;
     }
-    if (running_.exchange(true)) return;
+    if (running_.exchange(true)) return true;  // 이미 실행 중 — idempotent 성공
     if (worker_.joinable()) worker_.join();
     worker_ = std::thread([this] { run(); });
+    return true;
 }
 
 void ChannelHopper::stop() {
@@ -127,42 +128,83 @@ std::string ChannelHopper::summary() const {
     return oss.str();
 }
 
+/* 채널별 지수 backoff. 영구 skip 대신 실패 횟수에 따라 재시도 시각을 미루고,
+   성공하면 카운터 reset. 일시 장애 후 복구를 허용해 채널이 영구 사라지지 않게 한다.
+   1, 2, 4, 8, ... 초로 두 배씩 늘리되 5분에서 cap. */
 void ChannelHopper::run() {
-    constexpr int PER_CHANNEL_FAIL_LIMIT = 3;
+    using clock = std::chrono::steady_clock;
+    constexpr auto kBackoffBase = std::chrono::milliseconds(1000);
+    constexpr auto kBackoffCap  = std::chrono::milliseconds(5 * 60 * 1000);
 
-    std::vector<int>  failures(cfg_.channels.size(), 0);
-    std::vector<bool> skipped(cfg_.channels.size(), false);
+    struct ChState {
+        int                              failures = 0;
+        std::optional<clock::time_point> skipUntil;
+    };
+    std::vector<ChState> state(cfg_.channels.size());
+
+    auto computeBackoff = [&](int n) {
+        auto delay = kBackoffBase;
+        for (int i = 1; i < n; ++i) {
+            delay *= 2;
+            if (delay >= kBackoffCap) return kBackoffCap;
+        }
+        return delay;
+    };
 
     size_t idx = 0;
     while (running_.load()) {
-        size_t skipcount = 0;
-        while (skipped[idx]) {
-            idx = (idx + 1) % cfg_.channels.size();
-            if (++skipcount >= cfg_.channels.size()) {
-                LOG(ERROR) << "[hopper] 모든 채널 영구 실패 — channel hopping 중단";
-                running_.store(false);
-                return;
+        const auto now = clock::now();
+
+        // 현재 idx가 backoff 중이면 ready한 채널로 점프. 전부 backoff면 가장 이른 만료까지 대기.
+        if (state[idx].skipUntil.has_value() && now < state[idx].skipUntil.value()) {
+            std::optional<size_t>            readyIdx;
+            std::optional<clock::time_point> earliest;
+            for (size_t k = 0; k < cfg_.channels.size(); ++k) {
+                const size_t j = (idx + k) % cfg_.channels.size();
+                const auto&  s = state[j];
+                if (!s.skipUntil.has_value() || now >= s.skipUntil.value()) {
+                    readyIdx = j;
+                    break;
+                }
+                if (!earliest.has_value() || s.skipUntil.value() < earliest.value()) {
+                    earliest = s.skipUntil.value();
+                }
+            }
+            if (readyIdx.has_value()) {
+                idx = readyIdx.value();
+            } else {
+                const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    earliest.value() - clock::now());
+                if (wait.count() > 0) {
+                    LOG(WARNING) << "[hopper] 모든 채널 backoff 중 — "
+                                 << wait.count() << "ms 대기 후 재시도";
+                    sleepOrUntilStop(wait);
+                }
+                continue;
             }
         }
 
         const int ch = cfg_.channels[idx];
         if (setChannel(ch)) {
             currentChannel_.store(ch);
-            failures[idx] = 0;
+            if (state[idx].failures > 0) {
+                LOG(INFO) << "[hopper] 채널 " << ch
+                          << " 복구 (실패 카운터 reset, 직전 " << state[idx].failures << "회)";
+            }
+            state[idx].failures  = 0;
+            state[idx].skipUntil = std::nullopt;
             VLOG(1) << "[hopper] 채널 전환 성공: " << ch;
         } else {
             currentChannel_.store(-1);
-            failures[idx]++;
+            state[idx].failures++;
+            const auto delay     = computeBackoff(state[idx].failures);
+            state[idx].skipUntil = clock::now() + delay;
+            const auto delaySec  =
+                std::chrono::duration_cast<std::chrono::seconds>(delay).count();
             LOG(WARNING) << "[hopper] 채널 " << ch << " 변경 실패 "
-                         << "(시도 " << failures[idx]
-                         << "/" << PER_CHANNEL_FAIL_LIMIT << ")"
+                         << "(연속 " << state[idx].failures << "회) — "
+                         << delaySec << "s backoff 후 재시도"
                          << " → currentChannel = -1 (unknown)";
-            if (failures[idx] >= PER_CHANNEL_FAIL_LIMIT) {
-                skipped[idx] = true;
-                LOG(ERROR) << "[hopper] 채널 " << ch
-                           << " 영구 제외 — 밴드 미지원 또는 드라이버 거부 ("
-                           << PER_CHANNEL_FAIL_LIMIT << "회 실패)";
-            }
         }
 
         sleepOrUntilStop(cfg_.dwell);

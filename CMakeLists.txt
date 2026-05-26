@@ -48,6 +48,8 @@ add_executable(wips-parser
     src/parser/parser.cpp
     src/detector/deauth_detector.cpp
     src/hopper/channel_hopper.cpp
+    src/capture/capture.cpp
+    src/runtime/startup.cpp
 )
 
 find_package(Threads REQUIRED)
@@ -62,6 +64,8 @@ target_include_directories(wips-parser PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
     ${CMAKE_CURRENT_SOURCE_DIR}/include/hopper
     ${CMAKE_CURRENT_SOURCE_DIR}/include/log
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/capture
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/runtime
     ${PCAP_INCLUDE_DIR}
 )
 
@@ -75,3 +79,43 @@ target_compile_options(wips-parser PRIVATE
     -Wall
     -Wextra
 )
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+# GoogleTest가 설치돼 있으면 wips-tests 타겟 추가. 없으면 그냥 skip — 빌드 안 깨짐.
+#   Ubuntu/Debian : sudo apt install libgtest-dev
+#   Fedora/RHEL   : sudo dnf install gtest-devel
+#   Arch          : sudo pacman -S gtest
+# 실행: cd build && ctest --output-on-failure
+find_package(GTest QUIET)
+if(GTest_FOUND)
+    enable_testing()
+
+    add_executable(wips-tests
+        tests/test_deauth_detector.cpp
+        src/detector/deauth_detector.cpp
+    )
+
+    target_include_directories(wips-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/parser
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/log
+        ${PCAP_INCLUDE_DIR}
+    )
+
+    # pch.h가 <pcap.h>, <glog/logging.h>를 포함하므로 둘 다 링크 필요
+    target_link_libraries(wips-tests PRIVATE
+        ${PCAP_LIBRARY}
+        Threads::Threads
+        glog::glog
+        GTest::gtest
+        GTest::gtest_main
+    )
+
+    target_compile_options(wips-tests PRIVATE -Wall -Wextra)
+
+    include(GoogleTest)
+    gtest_discover_tests(wips-tests)
+else()
+    message(STATUS "GoogleTest not found — wips-tests 타겟 비활성. 설치 후 cmake 재실행하면 활성화됨.")
+endif()
