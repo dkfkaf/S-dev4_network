@@ -11,8 +11,3 @@ bool parse_channel_list(const char* csv, std::vector<int>& out);
 
 // root 권한 + iw 명령 가용성 확인. 실패 시 LOG(FATAL).
 void run_startup_diagnostics();
-
-// /var/log/wips 디렉토리 생성/확인 + glog log_dir 설정 시도.
-// 성공 시 true (caller가 alsologtostderr 사용 권장).
-// 실패 시 false (caller가 logtostderr로 fallback해야 함).
-bool init_log_dir();

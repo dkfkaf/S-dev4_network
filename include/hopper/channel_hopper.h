@@ -40,13 +40,13 @@ struct ChannelHopConfig {
 
 class ChannelHopper {
 public:
-    ChannelHopper(std::string iface, ChannelHopConfig cfg);
+    ChannelHopper(std::string iface, ChannelHopConfig config);
     ~ChannelHopper();
 
     ChannelHopper(const ChannelHopper&)            = delete;
     ChannelHopper& operator=(const ChannelHopper&) = delete;
 
-    // 시작 성공 시 true. cfg.channels가 비어 있으면 false (silent failure 방지).
+    // 시작 성공 시 true. config.channels가 비어 있으면 false (silent failure 방지).
     // 이미 실행 중이면 true (idempotent).
     bool start();
     void stop();
@@ -61,7 +61,7 @@ private:
     void sleepOrUntilStop(std::chrono::milliseconds dur);
 
     std::string               iface_;
-    ChannelHopConfig          cfg_;
+    ChannelHopConfig          config_;
     std::thread               worker_;
     std::atomic<bool>         running_{false};
     std::atomic<int>          currentChannel_{-1};

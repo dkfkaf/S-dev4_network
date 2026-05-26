@@ -1,3 +1,8 @@
+/* channel_hopper.cpp — ChannelHopper 구현.
+   worker thread가 config.channels을 순차 순회. 각 채널마다 'iw dev <iface> set channel N'을
+   fork/execlp로 호출(stderr는 errPipe로 캡처). 실패 시 채널별 재시도 지연이 점점 늘어남(1s→2s→...→5min cap).
+   stop()은 condition_variable로 dwell sleep을 즉시 인터럽터블. */
+
 #include "pch.h"
 #include "channel_hopper.h"
 #include <sys/wait.h>
@@ -5,13 +10,13 @@
 #include <sstream>
 
 
-ChannelHopper::ChannelHopper(std::string iface, ChannelHopConfig cfg)
-    : iface_(std::move(iface)), cfg_(std::move(cfg)) {}
+ChannelHopper::ChannelHopper(std::string iface, ChannelHopConfig config)
+    : iface_(std::move(iface)), config_(std::move(config)) {}
 
 ChannelHopper::~ChannelHopper() { stop(); }
 
 bool ChannelHopper::start() {
-    if (cfg_.channels.empty()) {
+    if (config_.channels.empty()) {
         LOG(ERROR) << "[hopper] channel list가 비어있어 channel hopper를 시작하지 않습니다";
         return false;
     }
@@ -62,14 +67,14 @@ bool ChannelHopper::setChannel(int channel) {
 
     ::close(errPipe[1]);
 
-    constexpr size_t kCapturedCap = 4096;
+    constexpr size_t maxStderrBytes = 4096;   // iw의 stderr는 최대 4KB까지만 캡처 (나머지는 버림)
     std::string captured;
     char buf[256];
     for (;;) {
         ssize_t n = ::read(errPipe[0], buf, sizeof(buf));
         if (n > 0) {
-            if (captured.size() < kCapturedCap) {
-                const size_t room = kCapturedCap - captured.size();
+            if (captured.size() < maxStderrBytes) {
+                const size_t room = maxStderrBytes - captured.size();
                 captured.append(buf,
                                 std::min(static_cast<size_t>(n), room));
             }
@@ -107,7 +112,7 @@ void ChannelHopper::sleepOrUntilStop(std::chrono::milliseconds dur) {
 
 std::string ChannelHopper::summary() const {
     std::vector<int> ch24, ch5;
-    for (int ch : cfg_.channels) {
+    for (int ch : config_.channels) {
         (ch <= 14 ? ch24 : ch5).push_back(ch);
     }
 
@@ -124,29 +129,29 @@ std::string ChannelHopper::summary() const {
     if (!ch24.empty())                       oss << "2.4GHz(" << joinCsv(ch24) << ")";
     if (!ch24.empty() && !ch5.empty())       oss << " + ";
     if (!ch5.empty())                        oss << "5GHz("   << joinCsv(ch5)  << ")";
-    oss << " — " << cfg_.dwell.count() << "ms dwell";
+    oss << " — " << config_.dwell.count() << "ms dwell";
     return oss.str();
 }
 
-/* 채널별 지수 backoff. 영구 skip 대신 실패 횟수에 따라 재시도 시각을 미루고,
+/* 채널별 지수 재시도 지연. 영구 skip 대신 실패 횟수에 따라 다음 시도 시각을 미루고,
    성공하면 카운터 reset. 일시 장애 후 복구를 허용해 채널이 영구 사라지지 않게 한다.
    1, 2, 4, 8, ... 초로 두 배씩 늘리되 5분에서 cap. */
 void ChannelHopper::run() {
     using clock = std::chrono::steady_clock;
-    constexpr auto kBackoffBase = std::chrono::milliseconds(1000);
-    constexpr auto kBackoffCap  = std::chrono::milliseconds(5 * 60 * 1000);
+    constexpr auto initialRetryDelay = std::chrono::milliseconds(1000);
+    constexpr auto maxRetryDelay  = std::chrono::milliseconds(5 * 60 * 1000);
 
     struct ChState {
         int                              failures = 0;
         std::optional<clock::time_point> skipUntil;
     };
-    std::vector<ChState> state(cfg_.channels.size());
+    std::vector<ChState> state(config_.channels.size());
 
-    auto computeBackoff = [&](int n) {
-        auto delay = kBackoffBase;
+    auto computeRetryDelay = [&](int n) {
+        auto delay = initialRetryDelay;
         for (int i = 1; i < n; ++i) {
             delay *= 2;
-            if (delay >= kBackoffCap) return kBackoffCap;
+            if (delay >= maxRetryDelay) return maxRetryDelay;
         }
         return delay;
     };
@@ -155,12 +160,12 @@ void ChannelHopper::run() {
     while (running_.load()) {
         const auto now = clock::now();
 
-        // 현재 idx가 backoff 중이면 ready한 채널로 점프. 전부 backoff면 가장 이른 만료까지 대기.
+        // 현재 idx가 재시도 지연 중이면 ready한 채널로 점프. 전부 지연 중이면 가장 이른 만료까지 대기.
         if (state[idx].skipUntil.has_value() && now < state[idx].skipUntil.value()) {
             std::optional<size_t>            readyIdx;
             std::optional<clock::time_point> earliest;
-            for (size_t k = 0; k < cfg_.channels.size(); ++k) {
-                const size_t j = (idx + k) % cfg_.channels.size();
+            for (size_t k = 0; k < config_.channels.size(); ++k) {
+                const size_t j = (idx + k) % config_.channels.size();
                 const auto&  s = state[j];
                 if (!s.skipUntil.has_value() || now >= s.skipUntil.value()) {
                     readyIdx = j;
@@ -176,7 +181,7 @@ void ChannelHopper::run() {
                 const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(
                     earliest.value() - clock::now());
                 if (wait.count() > 0) {
-                    LOG(WARNING) << "[hopper] 모든 채널 backoff 중 — "
+                    LOG(WARNING) << "[hopper] 모든 채널 재시도 지연 중 — "
                                  << wait.count() << "ms 대기 후 재시도";
                     sleepOrUntilStop(wait);
                 }
@@ -184,7 +189,7 @@ void ChannelHopper::run() {
             }
         }
 
-        const int ch = cfg_.channels[idx];
+        const int ch = config_.channels[idx];
         if (setChannel(ch)) {
             currentChannel_.store(ch);
             if (state[idx].failures > 0) {
@@ -197,17 +202,17 @@ void ChannelHopper::run() {
         } else {
             currentChannel_.store(-1);
             state[idx].failures++;
-            const auto delay     = computeBackoff(state[idx].failures);
+            const auto delay     = computeRetryDelay(state[idx].failures);
             state[idx].skipUntil = clock::now() + delay;
             const auto delaySec  =
                 std::chrono::duration_cast<std::chrono::seconds>(delay).count();
             LOG(WARNING) << "[hopper] 채널 " << ch << " 변경 실패 "
                          << "(연속 " << state[idx].failures << "회) — "
-                         << delaySec << "s backoff 후 재시도"
+                         << delaySec << "s 후 재시도"
                          << " → currentChannel = -1 (unknown)";
         }
 
-        sleepOrUntilStop(cfg_.dwell);
-        idx = (idx + 1) % cfg_.channels.size();
+        sleepOrUntilStop(config_.dwell);
+        idx = (idx + 1) % config_.channels.size();
     }
 }

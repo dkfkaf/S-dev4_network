@@ -1,3 +1,7 @@
+/* main.cpp — wips-parser 진입점.
+   CLI 파싱 → pcap/detector/hopper 조립 → capture 스레드 launch → SIGINT 대기 → shutdown 순서로 실행.
+   시그널 처리(g_signal_pipe self-pipe 패턴) + 프로세스 wiring 전담. 도메인 로직은 각 모듈에 위임. */
+
 #include "pch.h"
 #include "capture.h"
 #include "channel_hopper.h"
@@ -33,20 +37,16 @@ static void wait_for_shutdown_signal() {
 struct AdapterSetup {
     const char*      ifname;
     const char*      label;
-    ChannelHopConfig cfg;
+    ChannelHopConfig config;
 };
 
 // pcap_t를 unique_ptr로 감싸 자동 close — 모든 exit 경로에서 누수 방지.
 using PcapPtr = std::unique_ptr<pcap_t, decltype(&pcap_close)>;
 
 int main(int argc, char* argv[]) {
-    // 파일 로깅 가능 여부에 따라 alsologtostderr(파일+stderr) vs logtostderr(stderr only) 선택.
-    // 기존엔 항상 logtostderr=true라 log_dir 설정이 dead code였음.
-    const bool fileLogOk = init_log_dir();
     google::InitGoogleLogging(argv[0]);
-    if (fileLogOk) FLAGS_alsologtostderr = true;
-    else           FLAGS_logtostderr     = true;
-    FLAGS_v = 1;
+    FLAGS_logtostderr = true;
+    FLAGS_v           = 1;
 
     if (::pipe(g_signal_pipe) != 0) {
         LOG(FATAL) << "[init] signal pipe 생성 실패: "
@@ -62,18 +62,26 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
-        if (std::strcmp(a, "--band") == 0 && i + 1 < argc) {
+        if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
+            print_usage();
+            return 0;                                  // --help는 정상 종료
+        } else if (std::strcmp(a, "--band") == 0 && i + 1 < argc) {
             const char* v = argv[++i];
             if      (std::strcmp(v, "2g")  == 0) band = BandOpt::twoFour;
             else if (std::strcmp(v, "5g")  == 0) band = BandOpt::five;
             else if (std::strcmp(v, "all") == 0) band = BandOpt::all;
-            else { print_usage(); return 1; }
+            else {
+                std::cerr << "[init] 알 수 없는 --band 값: " << v << "\n";
+                print_usage();
+                return 1;
+            }
         } else if (std::strcmp(a, "--channels") == 0 && i + 1 < argc) {
             if (!parse_channel_list(argv[++i], customChannels)) {
                 LOG(ERROR) << "[init] --channels 파싱 실패: " << argv[i];
                 return 1;
             }
         } else if (a[0] == '-') {
+            std::cerr << "[init] 알 수 없는 옵션: " << a << "\n";
             print_usage();
             return 1;
         } else {
@@ -84,7 +92,7 @@ int main(int argc, char* argv[]) {
     run_startup_diagnostics();
 
     std::vector<AdapterSetup> adapters;
-    auto pickCfg = [&]() -> ChannelHopConfig {
+    auto pickConfig = [&]() -> ChannelHopConfig {
         if (!customChannels.empty()) {
             ChannelHopConfig c;
             c.channels = customChannels;
@@ -100,7 +108,7 @@ int main(int argc, char* argv[]) {
     };
 
     if (positional.size() == 1) {
-        adapters.push_back({positional[0], nullptr, pickCfg()});
+        adapters.push_back({positional[0], nullptr, pickConfig()});
     } else if (positional.size() == 2) {
         if (std::strcmp(positional[0], positional[1]) == 0) {
             LOG(ERROR) << "[init] fast-iface와 dfs-iface는 달라야 합니다: " << positional[0];
@@ -115,7 +123,7 @@ int main(int argc, char* argv[]) {
 
     for (const auto& a : adapters) {
         LOG(INFO) << "[init] 어댑터: " << a.ifname
-                  << " | 채널 목록: " << a.cfg.channels.size() << "개";
+                  << " | 채널 목록: " << a.config.channels.size() << "개";
     }
 
     // pcap 핸들을 RAII로 관리 — return 1 또는 main 종료 시 vector destructor가 자동 pcap_close.
@@ -126,12 +134,17 @@ int main(int argc, char* argv[]) {
         pcaps.push_back(std::move(p));
     }
 
+    // detector를 typed local로 먼저 받아 policySummary 추출 후 IDetector vector로 이동.
+    // 새 디텍터(EvilTwin 등) 추가도 동일 패턴 — concrete 타입에 접근 후 move.
+    auto deauthDet = std::make_unique<DeauthFloodDetector>();
+    const std::string deauthPolicy = deauthDet->policySummary();
+
     std::vector<std::unique_ptr<IDetector>> detectors;
-    detectors.push_back(std::make_unique<DeauthFloodDetector>());
+    detectors.push_back(std::move(deauthDet));
 
     std::vector<std::unique_ptr<ChannelHopper>> hoppers;
     for (const auto& a : adapters) {
-        hoppers.push_back(std::make_unique<ChannelHopper>(a.ifname, a.cfg));
+        hoppers.push_back(std::make_unique<ChannelHopper>(a.ifname, a.config));
         if (!hoppers.back()->start()) {
             LOG(ERROR) << "[init] channel hopper 시작 실패 (iface=" << a.ifname << ") — 종료";
             return 1;  // hoppers/pcaps RAII로 정리됨
@@ -146,8 +159,8 @@ int main(int argc, char* argv[]) {
         else                   std::cout << "interface     : ";
         std::cout << adapters[i].ifname << " — " << hoppers[i]->summary() << "\n";
     }
-    std::cout << "[*] deauth window : 10s (info=10/warn=20/critical=40 global,"
-                                       " 5/10/20 per-source)\n"
+    std::cout << "[*] deauth policy : " << deauthPolicy << "\n"
+              << "[*]                 정상 disconnect(reason 3/8)는 perSrcMac/perBssid에서 제외\n"
               << "[*] 802.11 management frame 캡처 시작 ... (Ctrl+C to stop)\n";
 
     std::signal(SIGINT,  on_sigint);

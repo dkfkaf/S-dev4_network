@@ -16,11 +16,16 @@ using clock_type = std::chrono::steady_clock;
 
 namespace {
 
-ParsedFrame mkDeauthFrame(const Mac& src, std::optional<int> channel = 6) {
+ParsedFrame mkDeauthFrame(const Mac& src,
+                          std::optional<int>      channel = 6,
+                          std::optional<Mac>      bssid   = std::nullopt,
+                          std::optional<uint16_t> reason  = std::nullopt) {
     ParsedFrame f{};
-    f.frameType = MGMT_SUBTYPE_DEAUTH;
-    f.src       = src;
-    f.channel   = channel;
+    f.frameType  = MGMT_SUBTYPE_DEAUTH;
+    f.src        = src;
+    f.channel    = channel;
+    if (bssid.has_value()) f.bssid = bssid.value();
+    f.reasonCode = reason;
     return f;
 }
 
@@ -115,8 +120,8 @@ TEST(Observe, NonDeauthFrameProducesNoAlerts) {
 
 TEST(Observe, AlertCarriesDeauthFloodPayload) {
     DeauthThresholds thresh;
-    thresh.global    = {2, 100, 1000};   // 2번째 deauth에서 global info
-    thresh.perSource = {99, 100, 101};   // per-source는 이 테스트에서 사실상 비활성
+    thresh.globalRate    = {2, 100, 1000};   // 2번째 deauth에서 global info
+    thresh.perSrcMac = {99, 100, 101};   // per-source는 이 테스트에서 사실상 비활성
     DeauthFloodDetector det(10s, thresh, 5s);
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
@@ -132,8 +137,8 @@ TEST(Observe, AlertCarriesDeauthFloodPayload) {
 
 TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
     DeauthThresholds thresh;
-    thresh.global    = {3, 100, 1000};      // 3개에서 info
-    thresh.perSource = {999, 1000, 1001};   // per-source 잠재 발사 방지
+    thresh.globalRate    = {3, 100, 1000};      // 3개에서 info
+    thresh.perSrcMac = {999, 1000, 1001};   // perSrcMac 잠재 발사 방지
     const auto cooldown = 5s;
     DeauthFloodDetector det(10s, thresh, cooldown);
 
@@ -143,17 +148,79 @@ TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
     det.observe(t0,           mkDeauthFrame(attacker));
     det.observe(t0 + 100ms,   mkDeauthFrame(attacker));
     auto firstFire = det.observe(t0 + 200ms, mkDeauthFrame(attacker));
-    EXPECT_EQ(countDeauthAlerts(firstFire, AlertScope::global, AlertSeverity::info), 1);
+    EXPECT_EQ(countDeauthAlerts(firstFire, AlertScope::globalRate, AlertSeverity::info), 1);
 
     // 같은 severity가 cooldown 안에 다시 임계 충족 — 억제되어야 함
     auto suppressed = det.observe(t0 + 500ms, mkDeauthFrame(attacker));
-    EXPECT_EQ(countDeauthAlerts(suppressed, AlertScope::global, AlertSeverity::info), 0);
+    EXPECT_EQ(countDeauthAlerts(suppressed, AlertScope::globalRate, AlertSeverity::info), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 정교화: reason code 필터, per-BSSID 카운터
+// ─────────────────────────────────────────────────────────────────────────────
+TEST(Observe, NormalDisconnectReasonSkipsPerSourceAndPerBssid) {
+    DeauthThresholds thresh;
+    thresh.globalRate    = {1000, 2000, 3000};  // global 안 뜨게
+    thresh.perSrcMac = {3, 100, 1000};       // 3개에서 info
+    thresh.perBssid  = {3, 100, 1000};
+    DeauthFloodDetector det(10s, thresh, 5s);
+
+    const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
+    const Mac target   = macOf("00:11:22:33:44:55");
+    const auto t0 = clock_type::now();
+
+    // reason=3 (STA leaving, 정상 disconnect) — perSrcMac/perBssid에서 제외돼야 함
+    det.observe(t0,         mkDeauthFrame(attacker, 6, target, 3));
+    det.observe(t0 + 50ms,  mkDeauthFrame(attacker, 6, target, 3));
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker, 6, target, 3));
+
+    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 0);
+    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perBssid,  AlertSeverity::info), 0);
+}
+
+TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
+    DeauthThresholds thresh;
+    thresh.globalRate    = {1000, 2000, 3000};
+    thresh.perSrcMac = {3, 100, 1000};
+    thresh.perBssid  = {1000, 2000, 3000};
+    DeauthFloodDetector det(10s, thresh, 5s);
+
+    const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
+    const Mac target   = macOf("00:11:22:33:44:55");
+    const auto t0 = clock_type::now();
+
+    // reason=7 (class 3 frame from non-associated STA — aireplay-ng 기본값)
+    det.observe(t0,         mkDeauthFrame(attacker, 6, target, 7));
+    det.observe(t0 + 50ms,  mkDeauthFrame(attacker, 6, target, 7));
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker, 6, target, 7));
+
+    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 1);
+}
+
+TEST(Observe, PerBssidAlertCatchesMacRandomizedAttack) {
+    DeauthThresholds thresh;
+    thresh.globalRate    = {1000, 2000, 3000};
+    thresh.perSrcMac = {1000, 2000, 3000};   // per-source는 트리거 안 되게
+    thresh.perBssid  = {3, 100, 1000};        // 3개에서 info
+    DeauthFloodDetector det(10s, thresh, 5s);
+
+    const Mac target = macOf("00:11:22:33:44:55");
+    const auto t0 = clock_type::now();
+
+    // MAC randomization 공격자 시뮬레이션 — 매번 다른 src, 같은 target BSSID
+    det.observe(t0,         mkDeauthFrame(macOf("AA:00:00:00:00:01"), 6, target, 7));
+    det.observe(t0 + 50ms,  mkDeauthFrame(macOf("AA:00:00:00:00:02"), 6, target, 7));
+    auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(macOf("AA:00:00:00:00:03"), 6, target, 7));
+
+    // per-source는 src가 모두 달라서 누적 안 됨. per-BSSID가 잡아냄 — 이게 핵심 가치.
+    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 0);
+    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perBssid,  AlertSeverity::info), 1);
 }
 
 TEST(Observe, EscalationBypassesCooldown) {
     DeauthThresholds thresh;
-    thresh.global    = {3, 5, 100};          // info=3, warn=5 — escalation 가능
-    thresh.perSource = {999, 1000, 1001};
+    thresh.globalRate    = {3, 5, 100};          // info=3, warn=5 — escalation 가능
+    thresh.perSrcMac = {999, 1000, 1001};
     DeauthFloodDetector det(10s, thresh, 5s);
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
@@ -163,10 +230,10 @@ TEST(Observe, EscalationBypassesCooldown) {
     det.observe(t0,           mkDeauthFrame(attacker));
     det.observe(t0 + 50ms,    mkDeauthFrame(attacker));
     auto fireInfo = det.observe(t0 + 100ms, mkDeauthFrame(attacker));
-    EXPECT_EQ(countDeauthAlerts(fireInfo, AlertScope::global, AlertSeverity::info), 1);
+    EXPECT_EQ(countDeauthAlerts(fireInfo, AlertScope::globalRate, AlertSeverity::info), 1);
 
     // 4, 5번째 — count=5에서 warn. 직전 alert로부터 0.3초 → cooldown 안. 그러나 escalation이라 발사.
     det.observe(t0 + 200ms, mkDeauthFrame(attacker));
     auto fireWarn = det.observe(t0 + 300ms, mkDeauthFrame(attacker));
-    EXPECT_EQ(countDeauthAlerts(fireWarn, AlertScope::global, AlertSeverity::warn), 1);
+    EXPECT_EQ(countDeauthAlerts(fireWarn, AlertScope::globalRate, AlertSeverity::warn), 1);
 }

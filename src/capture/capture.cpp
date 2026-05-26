@@ -77,13 +77,12 @@ void capture_loop(pcap_t* pcap, const char* label,
             const ParsedFrame& f = frame.value();
             print_frame(label, f);
 
-            // 한 frame당 ts를 한 번 산정해 모든 디텍터에 broadcast — 시간선 일관성.
+            // 한 frame당 timestamp를 한 번 산정해 모든 디텍터에 broadcast — 시간선 일관성.
             // 디텍터는 자신이 관심 있는 frameType만 처리하고 나머지는 빈 vector를 반환한다.
-            const auto ts = std::chrono::steady_clock::now();
+            const auto timestamp = std::chrono::steady_clock::now();
             for (auto& d : detectors) {
-                for (const auto& a : d->observe(ts, f)) {
-                    LOG(ERROR) << "[alert] " << format_alert(a);
-                    print_alert(a);
+                for (const auto& a : d->observe(timestamp, f)) {
+                    print_alert(a);   // stdout 단일 출력 — print_frame과 같은 스트림으로 시간 순 보임
                 }
             }
         }

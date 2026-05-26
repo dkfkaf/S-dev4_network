@@ -9,10 +9,11 @@
 #include "alert.h"
 #include "mgmt_parser.h"
 
-inline std::mutex g_outputMtx;
+// 헤더 전역 변수 회피 — function-local static으로 같은 효과 (C++17 magic statics가 thread-safe init 보장).
+inline std::mutex& outputMutex() { static std::mutex m; return m; }
 
 inline void print_frame(const char* label, const ParsedFrame& f) {
-    std::lock_guard<std::mutex> lock(g_outputMtx);
+    std::lock_guard<std::mutex> lock(outputMutex());
     if (label) std::cout << "[" << label << "]";
     std::cout
         << "[" << toString(f.frameType) << "]"
@@ -34,23 +35,39 @@ inline void print_frame(const char* label, const ParsedFrame& f) {
 
 inline std::string format_deauth_flood(const Alert& a, const DeauthFloodPayload& p) {
     std::ostringstream oss;
-    if (p.scope == AlertScope::global) {
-        oss << "global deauth flood: " << p.count
-            << " events in last " << p.window.count() << "ms";
-        if (a.channel.has_value()) oss << " (latest: ch=" << a.channel.value() << ")";
-    } else {
-        oss << "deauth from " << p.source.value().toString()
-            << ": " << p.count << " events in last " << p.window.count() << "ms"
-            << " (total=" << p.total;
-        if (a.channel.has_value())    oss << ", latest: ch=" << a.channel.value();
-        if (p.reasonCode.has_value()) oss << ", reason=" << p.reasonCode.value();
-        oss << ")";
+    switch (p.scope) {
+        case AlertScope::globalRate:
+            oss << "global deauth flood: " << p.count
+                << " events in last " << p.window.count() << "ms";
+            if (a.channel.has_value()) oss << " (latest: ch=" << a.channel.value() << ")";
+            break;
+        case AlertScope::perSrcMac:
+            // srcMac 없으면 producer 측 invariant 위반 — 메시지로 알리고 throw 회피
+            if (!p.srcMac.has_value()) { oss << "(perSrcMac alert without srcMac payload)"; break; }
+            oss << "deauth from srcMac=" << p.srcMac.value().toString()
+                << ": " << p.count << " events in last " << p.window.count() << "ms"
+                << " (total=" << p.total;
+            if (a.channel.has_value())    oss << ", ch=" << a.channel.value();
+            if (p.bssid.has_value())      oss << ", target=" << p.bssid.value().toString();
+            if (p.rssi.has_value())       oss << ", rssi=" << static_cast<int>(p.rssi.value()) << "dBm";
+            if (p.reasonCode.has_value()) oss << ", reason=" << p.reasonCode.value();
+            oss << ")";
+            break;
+        case AlertScope::perBssid:
+            if (!p.bssid.has_value()) { oss << "(perBssid alert without bssid payload)"; break; }
+            oss << "deauth targeting " << p.bssid.value().toString()
+                << ": " << p.count << " events in last " << p.window.count() << "ms"
+                << " (total=" << p.total;
+            if (a.channel.has_value())    oss << ", ch=" << a.channel.value();
+            if (p.rssi.has_value())       oss << ", rssi=" << static_cast<int>(p.rssi.value()) << "dBm";
+            if (p.reasonCode.has_value()) oss << ", latest_reason=" << p.reasonCode.value();
+            oss << ")";
+            break;
     }
     return oss.str();
 }
 
-/* 새 payload 추가 시 if constexpr 분기 하나만 늘리면 됨.
-   누락 시 컴파일 에러로 잡힘 (정적 type 매칭) — runtime "unknown category"보다 안전. */
+/*애는 모르겠는데*/
 inline std::string format_alert(const Alert& a) {
     return std::visit([&](const auto& payload) -> std::string {
         using T = std::decay_t<decltype(payload)>;
@@ -63,7 +80,7 @@ inline std::string format_alert(const Alert& a) {
 }
 
 inline void print_alert(const Alert& a) {
-    std::lock_guard<std::mutex> lock(g_outputMtx);
+    std::lock_guard<std::mutex> lock(outputMutex());
     std::cout << "[ALERT " << categoryName(a.payload)
               << " "       << toString(a.severity)
               << "] "      << format_alert(a) << "\n";

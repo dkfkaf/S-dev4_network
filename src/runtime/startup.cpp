@@ -1,6 +1,10 @@
+/* startup.cpp — 프로세스 시작 시 잡일.
+   CLI 사용법 출력(print_usage), --channels CSV 파싱(parse_channel_list),
+   root 권한 + iw 명령 가용성 사전 진단(run_startup_diagnostics).
+   파일 내부 헬퍼(valid_channel_set, exec_silent)는 anonymous namespace로 격리. */
+
 #include "pch.h"
 #include "startup.h"
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <cerrno>
@@ -10,14 +14,14 @@
 namespace {
 
 const std::vector<int>& valid_channel_set() {
-    static const std::vector<int> kValid = {
+    static const std::vector<int> validChannels = {
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
         36, 40, 44, 48,
         52, 56, 60, 64,
         100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
         149, 153, 157, 161, 165,
     };
-    return kValid;
+    return validChannels;
 }
 
 bool exec_silent(const char* prog, std::initializer_list<const char*> args) {
@@ -95,14 +99,3 @@ void run_startup_diagnostics() {
     LOG(INFO) << "[init] 사전 진단 통과 (root + iw 확인)";
 }
 
-bool init_log_dir() {
-    const char* path = "/var/log/wips";
-    if (::mkdir(path, 0755) == 0 || errno == EEXIST) {
-        FLAGS_log_dir = path;
-        return true;
-    }
-    std::cerr << "[init] " << path << " 사용 불가 ("
-              << std::generic_category().message(errno)
-              << ") — stderr 전용 로깅\n";
-    return false;
-}
