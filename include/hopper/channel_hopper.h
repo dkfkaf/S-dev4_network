@@ -25,17 +25,14 @@ struct ChannelHopConfig {
     };
 
     std::vector<int>          channels = NON_DFS_CHANNELS;
-    // 100ms = 채널 변경 오버헤드(~30ms) 이후에도 캡처 효율 77% 유지하는 sweet spot.
-    // burst가 작아지고 자주 와서 시각적으로 거의 연속처럼 보임.
-    std::chrono::milliseconds dwell    = std::chrono::milliseconds(100);
+    std::chrono::milliseconds dwell    = std::chrono::milliseconds(500);
 
     static ChannelHopConfig twoFourOnly() {
-        return {TWO_FOUR_CHANNELS, std::chrono::milliseconds(100)};
+        return {TWO_FOUR_CHANNELS, std::chrono::milliseconds(300)};
     }
     static ChannelHopConfig fastNonDfs() {
-        return {NON_DFS_CHANNELS, std::chrono::milliseconds(100)};
+        return {NON_DFS_CHANNELS, std::chrono::milliseconds(200)};
     }
-    // DFS는 CAC(Channel Availability Check) 비용이 커서 짧은 dwell이 의미 없음 — 2000ms 유지.
     static ChannelHopConfig dfsOnly() {
         return {DFS_CHANNELS, std::chrono::milliseconds(2000)};
     }

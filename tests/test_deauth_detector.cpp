@@ -122,7 +122,7 @@ TEST(Observe, AlertCarriesDeauthFloodPayload) {
     DeauthThresholds thresh;
     thresh.globalRate    = {2, 100, 1000};   // 2번째 deauth에서 global info
     thresh.perSrcMac = {99, 100, 101};   // per-source는 이 테스트에서 사실상 비활성
-    DeauthFloodDetector det(10s, thresh, 5s);
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();
@@ -140,7 +140,7 @@ TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
     thresh.globalRate    = {3, 100, 1000};      // 3개에서 info
     thresh.perSrcMac = {999, 1000, 1001};   // perSrcMac 잠재 발사 방지
     const auto cooldown = 5s;
-    DeauthFloodDetector det(10s, thresh, cooldown);
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, cooldown});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();
@@ -158,24 +158,27 @@ TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 정교화: reason code 필터, per-BSSID 카운터
 // ─────────────────────────────────────────────────────────────────────────────
-TEST(Observe, NormalDisconnectReasonSkipsPerSourceAndPerBssid) {
+TEST(Observe, NormalDisconnectReasonFullyExcludedFromAllScopes) {
     DeauthThresholds thresh;
-    thresh.globalRate    = {1000, 2000, 3000};  // global 안 뜨게
-    thresh.perSrcMac = {3, 100, 1000};       // 3개에서 info
-    thresh.perBssid  = {3, 100, 1000};
-    DeauthFloodDetector det(10s, thresh, 5s);
+    thresh.globalRate = {3, 100, 1000};       // 3개에서 globalRate info — 그런데 정상 disconnect라 트리거 안 돼야 함
+    thresh.perSrcMac  = {3, 100, 1000};
+    thresh.perBssid   = {3, 100, 1000};
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const Mac target   = macOf("00:11:22:33:44:55");
     const auto t0 = clock_type::now();
 
-    // reason=3 (STA leaving, 정상 disconnect) — perSrcMac/perBssid에서 제외돼야 함
+    // reason=3 (STA leaving, 정상 disconnect) — global/perSrcMac/perBssid 모두에서 완전 제외
     det.observe(t0,         mkDeauthFrame(attacker, 6, target, 3));
     det.observe(t0 + 50ms,  mkDeauthFrame(attacker, 6, target, 3));
     auto alerts = det.observe(t0 + 100ms, mkDeauthFrame(attacker, 6, target, 3));
 
-    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perSrcMac, AlertSeverity::info), 0);
-    EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perBssid,  AlertSeverity::info), 0);
+    // 어떤 scope에서도 alert 없어야 함 — 카운터에 누적조차 안 됨
+    EXPECT_TRUE(alerts.empty());
+    EXPECT_EQ(det.globalCount(), 0u);
+    EXPECT_EQ(det.trackedSrcMacs(), 0u);
+    EXPECT_EQ(det.trackedBssids(), 0u);
 }
 
 TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
@@ -183,7 +186,7 @@ TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
     thresh.globalRate    = {1000, 2000, 3000};
     thresh.perSrcMac = {3, 100, 1000};
     thresh.perBssid  = {1000, 2000, 3000};
-    DeauthFloodDetector det(10s, thresh, 5s);
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const Mac target   = macOf("00:11:22:33:44:55");
@@ -202,7 +205,7 @@ TEST(Observe, PerBssidAlertCatchesMacRandomizedAttack) {
     thresh.globalRate    = {1000, 2000, 3000};
     thresh.perSrcMac = {1000, 2000, 3000};   // per-source는 트리거 안 되게
     thresh.perBssid  = {3, 100, 1000};        // 3개에서 info
-    DeauthFloodDetector det(10s, thresh, 5s);
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
 
     const Mac target = macOf("00:11:22:33:44:55");
     const auto t0 = clock_type::now();
@@ -221,7 +224,7 @@ TEST(Observe, EscalationBypassesCooldown) {
     DeauthThresholds thresh;
     thresh.globalRate    = {3, 5, 100};          // info=3, warn=5 — escalation 가능
     thresh.perSrcMac = {999, 1000, 1001};
-    DeauthFloodDetector det(10s, thresh, 5s);
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();

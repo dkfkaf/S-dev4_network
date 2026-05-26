@@ -33,21 +33,25 @@ struct SeverityTier {
     size_t critical;
 };
 
-// 임계치 상향 — 이전 기본값(10/20/40 globalRate, 5/10/20 perSrcMac)은 정상 핸드폰 활동을
-// CRITICAL로 잘못 분류. 진짜 flood는 초당 수십~수백개라 새 값으로도 즉시 critical.
 struct DeauthThresholds {
-    SeverityTier globalRate = {50, 100, 200};   // 10s에 5/10/20건/s 도달 시 단계
-    SeverityTier perSrcMac  = {30, 60, 100};    // 단일 송신자(addr2) burst
-    SeverityTier perBssid   = {20, 50, 100};    // 한 BSS 표적 burst (가장 신뢰도 높은 신호)
+    SeverityTier globalRate = {50, 100, 200};   // 10s 내 deauth 총합 (raw rate)
+    SeverityTier perSrcMac  = {30,  60, 100};   // 단일 송신자(addr2) burst
+    SeverityTier perBssid   = {20,  50, 100};   // 한 BSS 표적 burst (가장 신뢰도 높은 신호)
+};
+
+// 생성자 인자가 5개까지 늘어나 헷갈리던 것 → 한 struct로 묶음.
+// 필드 이름으로 의도 명확, 새 인자 추가해도 호출 사이트 안 깨짐.
+struct DeauthDetectorConfig {
+    std::chrono::milliseconds  window            = std::chrono::seconds(10);
+    DeauthThresholds           thresholds;
+    std::chrono::milliseconds  cooldown          = std::chrono::seconds(3);
+    std::chrono::milliseconds  sourceIdleTimeout = std::chrono::minutes(5);
+    std::chrono::milliseconds  removalInterval   = std::chrono::seconds(30);
 };
 
 class DeauthFloodDetector : public IDetector {
 public:
-    DeauthFloodDetector(std::chrono::milliseconds window            = std::chrono::seconds(10),
-                        DeauthThresholds          thresh            = {},
-                        std::chrono::milliseconds cooldown          = std::chrono::seconds(3),
-                        std::chrono::milliseconds sourceIdleTimeout = std::chrono::minutes(5),
-                        std::chrono::milliseconds removalInterval   = std::chrono::seconds(30));
+    DeauthFloodDetector(DeauthDetectorConfig config = {});
 
     const char* name() const override { return "deauth_flood"; }
 

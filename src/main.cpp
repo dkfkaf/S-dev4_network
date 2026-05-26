@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 static std::atomic<bool> g_running(true);
@@ -100,7 +101,7 @@ int main(int argc, char* argv[]) {
         if (!customChannels.empty()) {
             ChannelHopConfig c;
             c.channels = customChannels;
-            c.dwell    = std::chrono::milliseconds(100);
+            c.dwell    = std::chrono::milliseconds(500);
             return c;
         }
         switch (band) {
@@ -123,6 +124,30 @@ int main(int argc, char* argv[]) {
     } else {
         print_usage();
         return 1;
+    }
+
+    // 어댑터별 capability 조회 — `iw phy info`로 지원 채널 알아내서 미지원 채널은 자동 제외.
+    // 2.4GHz만 지원하는 어댑터에 5GHz 채널 시도해서 매번 실패 로그 띄우는 noise 방지.
+    for (auto& a : adapters) {
+        auto supported = querySupportedChannels(a.ifname);
+        if (supported.empty()) continue;   // 조회 실패 → config 그대로 사용
+        std::unordered_set<int> supportedSet(supported.begin(), supported.end());
+        std::vector<int> filtered;
+        for (int ch : a.config.channels) {
+            if (supportedSet.count(ch)) filtered.push_back(ch);
+        }
+        const size_t before = a.config.channels.size();
+        const size_t after = filtered.size();
+        if (after != before) {
+            LOG(INFO) << "[init] iface=" << a.ifname
+                      << " 지원 채널 자동 필터: " << before << "개 → " << after << "개"
+                      << " (어댑터 미지원 " << (before - after) << "개 제외)";
+        }
+        if (filtered.empty()) {
+            LOG(ERROR) << "[init] iface=" << a.ifname << " 설정 채널 전부 미지원 — 종료";
+            return 1;
+        }
+        a.config.channels = std::move(filtered);
     }
 
     for (const auto& a : adapters) {
@@ -164,7 +189,7 @@ int main(int argc, char* argv[]) {
         std::cout << adapters[i].ifname << " — " << hoppers[i]->summary() << "\n";
     }
     std::cout << "[*] deauth policy : " << deauthPolicy << "\n"
-              << "[*]                 정상 disconnect(reason 3/8)는 perSrcMac/perBssid에서 제외\n"
+              << "[*]                 정상 disconnect(reason 3/8)는 모든 카운터에서 완전 제외 (alert 없음)\n"
               << "[*] 802.11 management frame 캡처 시작 ... (Ctrl+C to stop)\n";
 
     std::signal(SIGINT,  on_sigint);

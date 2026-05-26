@@ -20,16 +20,12 @@ bool isNormalDisconnect(std::optional<uint16_t> reason) {
 
 }  // namespace
 
-DeauthFloodDetector::DeauthFloodDetector(std::chrono::milliseconds window,
-                                         DeauthThresholds          thresh,
-                                         std::chrono::milliseconds cooldown,
-                                         std::chrono::milliseconds sourceIdleTimeout,
-                                         std::chrono::milliseconds removalInterval)
-    : window_(window),
-      thresh_(thresh),
-      cooldown_(cooldown),
-      sourceIdleTimeout_(sourceIdleTimeout),
-      removalInterval_(removalInterval) {}
+DeauthFloodDetector::DeauthFloodDetector(DeauthDetectorConfig config)
+    : window_(config.window),
+      thresh_(config.thresholds),
+      cooldown_(config.cooldown),
+      sourceIdleTimeout_(config.sourceIdleTimeout),
+      removalInterval_(config.removalInterval) {}
 
 // deque의 시간 순 정렬 가정 활용 — front가 cutoff보다 옛날이면 pop, 아니면 뒤는 다 윈도우 안 (amortized O(1)).
 void DeauthFloodDetector::trimWindow(Window& q, TimePoint cutoff) {
@@ -54,18 +50,21 @@ bool DeauthFloodDetector::shouldAlert(const CooldownState& state,
 }
 
 // 아래 const 조회 메서드들이 mutex_를 잡으므로 mutex_는 mutable.
+// 다단 출력 — caller가 "[*] deauth policy : " (20자) prefix로 첫 줄 시작 후,
+// 연속 줄은 동일 20자 들여쓰기로 정렬되도록 \n + 공백 20개 삽입.
 std::string DeauthFloodDetector::policySummary() const {
     const auto windowSec = std::chrono::duration_cast<std::chrono::seconds>(window_).count();
     const auto cooldownSec = std::chrono::duration_cast<std::chrono::seconds>(cooldown_).count();
     const auto& g = thresh_.globalRate;
     const auto& s = thresh_.perSrcMac;
     const auto& b = thresh_.perBssid;
+    const char* indent = "\n                    ";   // 20자 — "[*] deauth policy : "와 정렬
     std::ostringstream oss;
-    oss << "window=" << windowSec << "s, cooldown=" << cooldownSec << "s, "
-        << "thresholds(info/warn/critical): "
-        << "globalRate=" << g.info << "/" << g.warn << "/" << g.critical << ", "
-        << "perSrcMac="  << s.info << "/" << s.warn << "/" << s.critical << ", "
-        << "perBssid="   << b.info << "/" << b.warn << "/" << b.critical;
+    oss << "window=" << windowSec << "s, cooldown=" << cooldownSec << "s"
+        << indent << "thresholds (info/warn/critical):"
+        << indent << "  globalRate " << g.info << "/" << g.warn << "/" << g.critical
+        << indent << "  perSrcMac  " << s.info << "/" << s.warn << "/" << s.critical
+        << indent << "  perBssid   " << b.info << "/" << b.warn << "/" << b.critical;
     return oss.str();
 }
 
@@ -109,18 +108,22 @@ std::vector<Alert> DeauthFloodDetector::observe(TimePoint timestamp, const Parse
     const TimePoint now = globalEvents_.empty()
         ? timestamp
         : std::max(timestamp, globalEvents_.back());
-    const TimePoint cutoff = now - window_;
 
-    processGlobalEvent(frame, now, cutoff, alerts);   // global은 항상 누적 (raw rate, broadcast 백스톱)
-
-    // 정상 disconnect(reason 3/8)는 perSrcMac/perBssid 카운터 제외 — 핸드폰 toggle false positive 방지
-    if (!isNormalDisconnect(frame.reasonCode)) {
-        processPerSrcMacEvent(frame, now, cutoff, alerts);
-        processPerBssidEvent (frame, now, cutoff, alerts);
-    }
-
+    // idle entry cleanup은 항상 실행 — 정상 disconnect 기간에도 30초 throttle 내에서 만료.
+    // globalEvents_도 같이 trim해야 globalCount()가 stale 안 됨.
     forgetIdleSrcMacs(now);
     forgetIdleBssids(now);
+    trimWindow(globalEvents_, now - window_);
+
+    // reason 3/8(정상 disconnect)은 카운터 누적 + alert 전부 skip. trade-off: 공격자가 reason=3/8로
+    // 위장하면 미탐 — 단, 시중 도구 대부분 reason=7 사용해서 실용 우회는 거의 없음.
+    if (isNormalDisconnect(frame.reasonCode)) return {};
+
+    const TimePoint cutoff = now - window_;
+
+    processGlobalEvent  (frame, now, cutoff, alerts);
+    processPerSrcMacEvent(frame, now, cutoff, alerts);
+    processPerBssidEvent (frame, now, cutoff, alerts);
 
     return alerts;
 }
