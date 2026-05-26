@@ -184,7 +184,7 @@ sudo airmon-ng start wlan0
 ## 실행
 
 ### Single-adapter 모드
-어댑터 1개로 2.4GHz + 5GHz non-DFS 11채널 × 500ms 순환.
+어댑터 1개로 2.4GHz + 5GHz non-DFS 11채널 × 100ms 순환.
 
 ```bash
 sudo ./wips-parser mon0
@@ -196,7 +196,7 @@ sudo ./wips-parser mon0
 ```bash
 sudo ./wips-parser mon0 mon1
 ```
-- `mon0` (fast): 2.4GHz + 5GHz non-DFS, 200ms dwell — 2.2초/cycle
+- `mon0` (fast): 2.4GHz + 5GHz non-DFS, 100ms dwell — 1.1초/cycle
 - `mon1` (dfs):  5GHz DFS 전담, 2000ms dwell — 24초/cycle (CAC 비용 amortize)
 
 ### 옵션
@@ -217,7 +217,7 @@ sudo ./wips-parser --channels 1,6,11 mon0  # 명시 채널만
 ### 시작 배너
 ```
 [*] mode          : single-adapter
-[*] interface     : mon0 — 2.4GHz(1,6,11) + 5GHz(36,40,44,48,149,153,157,161) — 500ms dwell
+[*] interface     : mon0 — 2.4GHz(1,6,11) + 5GHz(36,40,44,48,149,153,157,161) — 100ms dwell
 [*] deauth policy : window=10s, info/warn/critical thresholds:
 [*]                 global    50/100/200
 [*]                 perSrcMac 30/60/100
@@ -369,14 +369,14 @@ struct ParsedFrame {
 global 카운터는 모든 deauth 누적 (raw rate 가시성, broadcast 공격 backstop).
 
 ### Channel list 기본값
-**Single-adapter** (`ChannelHopConfig{}`): 11채널 × 500ms = 5.5초 cycle
+**Single-adapter** (`ChannelHopConfig{}`): 11채널 × 100ms = 1.1초 cycle
 ```
 2.4GHz : 1, 6, 11
 5GHz   : 36, 40, 44, 48, 149, 153, 157, 161   (non-DFS)
 ```
 
 **Dual-adapter** (`fastNonDfs()` + `dfsOnly()`):
-- fast: 위와 동일 11채널 × 200ms = 2.2초 cycle
+- fast: 위와 동일 11채널 × 100ms = 1.1초 cycle
 - dfs:  `52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140` × 2000ms = 24초 cycle
 
 ---

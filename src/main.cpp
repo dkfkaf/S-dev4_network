@@ -44,6 +44,10 @@ struct AdapterSetup {
 using PcapPtr = std::unique_ptr<pcap_t, decltype(&pcap_close)>;
 
 int main(int argc, char* argv[]) {
+    // 파이프/redirect(`| tee`, `> log`)에서도 stdout을 line-buffered로 유지.
+    // 기본은 파이프 시 block-buffered(4KB) — frame 출력이 모였다가 burst로 dump됨.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     google::InitGoogleLogging(argv[0]);
     FLAGS_logtostderr = true;
     FLAGS_v           = 1;
@@ -96,7 +100,7 @@ int main(int argc, char* argv[]) {
         if (!customChannels.empty()) {
             ChannelHopConfig c;
             c.channels = customChannels;
-            c.dwell    = std::chrono::milliseconds(500);
+            c.dwell    = std::chrono::milliseconds(100);
             return c;
         }
         switch (band) {

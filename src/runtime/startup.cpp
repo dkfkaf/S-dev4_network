@@ -55,12 +55,12 @@ void print_usage() {
     std::cout
         << "syntax : wips-parser [--band 2g|5g|all] [--channels c1,c2,...] <iface> [<dfs-iface>]\n"
         << "  single-adapter : wips-parser mon0\n"
-        << "                   2.4GHz + 5GHz non-DFS 모든 채널 순환 (500ms dwell)\n"
+        << "                   2.4GHz + 5GHz non-DFS 모든 채널 순환 (100ms dwell)\n"
         << "  2.4GHz only    : wips-parser --band 2g mon0\n"
         << "  5GHz only      : wips-parser --band 5g mon0\n"
         << "  custom         : wips-parser --channels 1,6,11 mon0\n"
         << "  dual-adapter   : wips-parser mon0 mon1\n"
-        << "                   <iface>     : 2.4GHz + 5GHz non-DFS 빠른 sweep (200ms)\n"
+        << "                   <iface>     : 2.4GHz + 5GHz non-DFS 빠른 sweep (100ms)\n"
         << "                   <dfs-iface> : 5GHz DFS 전담 (2000ms dwell)\n";
 }
 
