@@ -1,13 +1,12 @@
 /* channel_hopper.cpp — ChannelHopper 구현.
-   worker thread가 config.channels을 순차 순회. 각 채널마다 'iw dev <iface> set channel N'을
-   fork/execlp로 호출(stderr는 errPipe로 캡처). 미지원 채널은 startup에서 사전 필터됨 —
+   worker thread가 config.channels을 순차 순회. 각 채널마다 `iw dev <iface> set channel N`을
+   run_subprocess로 호출 (stderr 캡처). 미지원 채널은 startup에서 사전 필터됨 —
    여기 도달하는 채널은 어댑터 지원. 일시 실패해도 다음 cycle에 자동 재시도.
    stop()은 condition_variable로 dwell sleep을 즉시 인터럽터블. */
 
 #include "pch.h"
 #include "channel_hopper.h"
-#include <sys/wait.h>
-#include <cerrno>
+#include "subprocess.h"
 
 
 ChannelHopper::ChannelHopper(std::string iface, ChannelHopConfig config)
@@ -33,69 +32,17 @@ void ChannelHopper::stop() {
 }
 
 bool ChannelHopper::setChannel(int channel) {
-    char chBuf[16];
-    std::snprintf(chBuf, sizeof(chBuf), "%d", channel);
+    SubprocessOpts opts; opts.captureStderr = true;
+    auto r = run_subprocess({"iw", "dev", iface_, "set", "channel",
+                             std::to_string(channel)}, opts);
+    if (r.succeeded()) return true;
 
-    int errPipe[2] = {-1, -1};
-    if (::pipe(errPipe) != 0) {
-        LOG(ERROR) << "[iw] pipe() 실패: "
-                   << std::generic_category().message(errno);
-        return false;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        ::close(errPipe[0]);
-        ::close(errPipe[1]);
-        return false;
-    }
-
-    if (pid == 0) {
-        ::close(errPipe[0]);
-        ::dup2(errPipe[1], STDERR_FILENO);
-        ::close(errPipe[1]);
-        ::execlp("iw", "iw", "dev", iface_.c_str(), "set", "channel", chBuf,
-                 static_cast<char*>(nullptr));
-        ::_exit(127);
-    }
-
-    ::close(errPipe[1]);
-
-    constexpr size_t maxStderrBytes = 4096;   // iw의 stderr는 최대 4KB까지만 캡처 (나머지는 버림)
-    std::string captured;
-    char buf[256];
-    for (;;) {
-        ssize_t n = ::read(errPipe[0], buf, sizeof(buf));
-        if (n > 0) {
-            if (captured.size() < maxStderrBytes) {
-                const size_t room = maxStderrBytes - captured.size();
-                captured.append(buf,
-                                std::min(static_cast<size_t>(n), room));
-            }
-            continue;
-        }
-        if (n == 0) break;
-        if (errno != EINTR) break;
-    }
-    ::close(errPipe[0]);
-
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
-    }
-
-    const bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    if (!ok) {
-        while (!captured.empty() &&
-               (captured.back() == '\n' || captured.back() == '\r')) {
-            captured.pop_back();
-        }
-        const int exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-        LOG(ERROR) << "[iw] 채널 " << channel << " 변경 실패"
-                   << " | exit_code=" << exitCode
-                   << " | stderr: " << (captured.empty() ? "(empty)" : captured);
-    }
-    return ok;
+    std::string err = r.stderrText;
+    while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
+    LOG(ERROR) << "[iw] 채널 " << channel << " 변경 실패"
+               << " | exit_code=" << r.exitCode
+               << " | stderr: " << (err.empty() ? "(empty)" : err);
+    return false;
 }
 
 void ChannelHopper::sleepOrUntilStop(std::chrono::milliseconds dur) {

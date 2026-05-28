@@ -50,6 +50,7 @@ add_executable(wips-parser
     src/hopper/channel_hopper.cpp
     src/capture/capture.cpp
     src/runtime/startup.cpp
+    src/runtime/subprocess.cpp
 )
 
 find_package(Threads REQUIRED)
@@ -95,12 +96,14 @@ if(GTest_FOUND)
         tests/test_startup.cpp
         src/detector/deauth_detector.cpp
         src/runtime/startup.cpp
+        src/runtime/subprocess.cpp
     )
 
     target_include_directories(wips-tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/include/parser
         ${CMAKE_CURRENT_SOURCE_DIR}/include/detector
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/hopper
         ${CMAKE_CURRENT_SOURCE_DIR}/include/log
         ${CMAKE_CURRENT_SOURCE_DIR}/include/runtime
         ${PCAP_INCLUDE_DIR}

@@ -1,6 +1,6 @@
 /* deauth_detector.cpp — DeauthFloodDetector 구현 (IDetector::observe).
    들어온 deauth frame을 3차원(globalRate / perSrcMac / perBssid) 슬라이딩 윈도우에 누적,
-   임계치 도달 시 cooldown+escalation 정책으로 Alert 발사.
+   임계치 도달 시 edge-triggered 정책으로 Alert 발사 (severity가 올라갈 때만 알림).
    reason 3/8(정상 disconnect)는 perSrcMac/perBssid 카운터에서 제외. idle entry 5분 후 cleanup. */
 
 #include "pch.h"
@@ -24,6 +24,9 @@ void DeauthFloodDetector::forgetIdleEntries(std::map<Mac, DeauthEntryStats>& m,
                                             std::chrono::milliseconds        idleTimeout) {
     if (lastRun.has_value() && (now - lastRun.value()) < interval) return;
     lastRun = now;
+    // map<Mac, DeauthEntryStats>의 iterator —
+    //   it->first  = Mac (키, 송신자 또는 BSSID MAC 주소)
+    //   it->second = DeauthEntryStats (값, recent/total/lastDeauthSeen/lastAlertSeverity)
     for (auto it = m.begin(); it != m.end(); ) {
         if (it->second.recent.empty() && (now - it->second.lastDeauthSeen) > idleTimeout) {
             it = m.erase(it);
@@ -41,16 +44,9 @@ void DeauthFloodDetector::updateEntryStats(DeauthEntryStats& stats, TimePoint no
     stats.lastDeauthSeen = now;
 }
 
-// alert 발사 후 cooldown 갱신 — global/perSrcMac/perBssid 셋 다 같은 2줄.
-void DeauthFloodDetector::markAlertFired(CooldownState& state, TimePoint now, AlertSeverity severity) {
-    state.lastAlert         = now;
-    state.lastAlertSeverity = severity;
-}
-
 DeauthFloodDetector::DeauthFloodDetector(DeauthDetectorConfig config)
     : window_(config.window),
       thresh_(config.thresholds),
-      cooldown_(config.cooldown),
       sourceIdleTimeout_(config.sourceIdleTimeout),
       removalInterval_(config.removalInterval) {}
 
@@ -67,13 +63,12 @@ std::optional<AlertSeverity> DeauthFloodDetector::severityFor(size_t count,
     return std::nullopt;
 }
 
-// 첫 alert → 발사. escalation(severity 상승) → cooldown 무시 발사. 같은/낮은 severity → cooldown 적용.
-bool DeauthFloodDetector::shouldAlert(const CooldownState& state,
-                                      AlertSeverity        currentSeverity,
-                                      TimePoint            now) const {
-    if (!state.lastAlert.has_value()) return true;
-    if (currentSeverity > state.lastAlertSeverity.value()) return true;
-    return (now - state.lastAlert.value()) >= cooldown_;
+// edge-triggered: last가 nullopt(첫 진입)거나 current가 last보다 높은 단계일 때만 발사.
+// 같은 단계 재진입은 노이즈 — count가 info 미만으로 떨어졌다가 다시 올라와야 새 burst로 인식.
+bool DeauthFloodDetector::isUpwardTransition(std::optional<AlertSeverity> last,
+                                             AlertSeverity                current) {
+    if (!last.has_value()) return true;
+    return current > last.value();
 }
 
 namespace {
@@ -87,9 +82,8 @@ std::string formatTier(const char* name, const SeverityTier& t) {
 // 줄 단위 — indent/prefix는 caller가 결정. detector는 자기 데이터만 표현.
 std::vector<std::string> DeauthFloodDetector::policyLines() const {
     const auto windowSec = std::chrono::duration_cast<std::chrono::seconds>(window_).count();
-    const auto cooldownSec = std::chrono::duration_cast<std::chrono::seconds>(cooldown_).count();
     std::ostringstream firstLine;
-    firstLine << "window=" << windowSec << "s, cooldown=" << cooldownSec << "s";
+    firstLine << "window=" << windowSec << "s, edge-triggered (severity 상승 시에만 알림)";
 
     return {
         firstLine.str(),
@@ -132,15 +126,20 @@ std::vector<Alert> DeauthFloodDetector::observe(TimePoint timestamp, const Parse
 }
 
 
-// 전역 raw rate 누적 + 단일 cooldown (채널별 세분은 perBssid가 담당).
+// 전역 raw rate 누적 (채널별 세분은 perBssid가 담당).
 // trim은 observe()가 이미 했으므로 여기선 push만.
+// edge-triggered: count가 info 미만으로 떨어지면 lastSeverity 리셋(다음 burst 시 재발사 가능).
 void DeauthFloodDetector::processGlobalEvent(const ParsedFrame&  frame,
                                              TimePoint           now,
                                              std::vector<Alert>& alerts) {
     globalEvents_.push_back(now);
 
     auto severity = severityFor(globalEvents_.size(), thresh_.globalRate);
-    if (!severity.has_value() || !shouldAlert(globalCooldown_, severity.value(), now)) return;
+    if (!severity.has_value()) {
+        globalLastAlertSeverity_ = std::nullopt;
+        return;
+    }
+    if (!isUpwardTransition(globalLastAlertSeverity_, severity.value())) return;
 
     alerts.push_back(Alert{
         severity.value(),
@@ -154,10 +153,10 @@ void DeauthFloodDetector::processGlobalEvent(const ParsedFrame&  frame,
             std::nullopt,
         },
     });
-    markAlertFired(globalCooldown_, now, severity.value());
+    globalLastAlertSeverity_ = severity.value();
 }
 
-// 송신자(addr2) MAC별 누적. stats는 map 값의 참조 — stats.state 갱신이 곧 srcMacStats_[src].state 갱신.
+// 송신자(addr2) MAC별 누적. stats는 map 값의 참조 — stats.lastAlertSeverity 갱신이 곧 map 갱신.
 void DeauthFloodDetector::processPerSrcMacEvent(const ParsedFrame&  frame,
                                                 TimePoint           now,
                                                 TimePoint           cutoff,
@@ -166,7 +165,11 @@ void DeauthFloodDetector::processPerSrcMacEvent(const ParsedFrame&  frame,
     updateEntryStats(stats, now, cutoff);
 
     auto severity = severityFor(stats.recent.size(), thresh_.perSrcMac);
-    if (!severity.has_value() || !shouldAlert(stats.state, severity.value(), now)) return;
+    if (!severity.has_value()) {
+        stats.lastAlertSeverity = std::nullopt;
+        return;
+    }
+    if (!isUpwardTransition(stats.lastAlertSeverity, severity.value())) return;
 
     alerts.push_back(Alert{
         severity.value(),
@@ -182,7 +185,7 @@ void DeauthFloodDetector::processPerSrcMacEvent(const ParsedFrame&  frame,
             frame.reasonCode,
         },
     });
-    markAlertFired(stats.state, now, severity.value());
+    stats.lastAlertSeverity = severity.value();
 }
 
 // 표적 BSSID별 누적 — MAC randomization 우회 (attacker가 src를 바꿔도 표적은 고정).
@@ -194,7 +197,11 @@ void DeauthFloodDetector::processPerBssidEvent(const ParsedFrame&  frame,
     updateEntryStats(stats, now, cutoff);
 
     auto severity = severityFor(stats.recent.size(), thresh_.perBssid);
-    if (!severity.has_value() || !shouldAlert(stats.state, severity.value(), now)) return;
+    if (!severity.has_value()) {
+        stats.lastAlertSeverity = std::nullopt;
+        return;
+    }
+    if (!isUpwardTransition(stats.lastAlertSeverity, severity.value())) return;
 
     alerts.push_back(Alert{
         severity.value(),
@@ -210,6 +217,6 @@ void DeauthFloodDetector::processPerBssidEvent(const ParsedFrame&  frame,
             frame.reasonCode,
         },
     });
-    markAlertFired(stats.state, now, severity.value());
+    stats.lastAlertSeverity = severity.value();
 }
 

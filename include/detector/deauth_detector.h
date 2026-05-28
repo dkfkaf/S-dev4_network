@@ -13,17 +13,14 @@
 
 using Window = std::deque<TimePoint>;
 
-struct CooldownState {
-    std::optional<TimePoint>     lastAlert;
-    std::optional<AlertSeverity> lastAlertSeverity;
-};
-
 // perSrcMac/perBssid가 동일한 통계 형태 — 한 type으로 통합. 의미 구분은 alias로.
+// edge-triggered: lastAlertSeverity는 "마지막으로 알린 단계". 같은 단계는 재발사 안 함.
+// count가 info 미만으로 떨어지면 nullopt로 리셋 → 새 버스트 시 다시 발사.
 struct DeauthEntryStats {
-    Window         recent;
-    uint64_t       total = 0;
-    TimePoint      lastDeauthSeen;
-    CooldownState  state;
+    Window                       recent;
+    uint64_t                     total = 0;
+    TimePoint                    lastDeauthSeen;
+    std::optional<AlertSeverity> lastAlertSeverity;
 };
 using DeauthSrcMacStats = DeauthEntryStats;
 using DeauthBssidStats  = DeauthEntryStats;
@@ -45,7 +42,6 @@ struct DeauthThresholds {
 struct DeauthDetectorConfig {
     std::chrono::milliseconds  window            = std::chrono::seconds(10);
     DeauthThresholds           thresholds;
-    std::chrono::milliseconds  cooldown          = std::chrono::seconds(3);
     std::chrono::milliseconds  sourceIdleTimeout = std::chrono::minutes(5);
     std::chrono::milliseconds  removalInterval   = std::chrono::seconds(30);
 };
@@ -66,7 +62,8 @@ public:
     static std::optional<AlertSeverity> severityFor(size_t count, const SeverityTier& tier);
 
 private:
-    bool shouldAlert(const CooldownState& state, AlertSeverity currentSeverity, TimePoint now) const;
+    // edge-triggered: count→severity 계산 후 last보다 "올라갔을 때"만 true.
+    static bool isUpwardTransition(std::optional<AlertSeverity> last, AlertSeverity current);
 
     // 송신자 합산은 cutoff 안 씀(observe()에서 이미 trim) — 시그니처 정직화.
     void processGlobalEvent(const ParsedFrame& frame, TimePoint now,
@@ -84,18 +81,16 @@ private:
                                   std::chrono::milliseconds        interval,
                                   std::chrono::milliseconds        idleTimeout);
     static void updateEntryStats(DeauthEntryStats& stats, TimePoint now, TimePoint cutoff);
-    static void markAlertFired(CooldownState& state, TimePoint now, AlertSeverity severity);
 
     std::chrono::milliseconds  window_;
     DeauthThresholds           thresh_;
-    std::chrono::milliseconds  cooldown_;
     std::chrono::milliseconds  sourceIdleTimeout_;
     std::chrono::milliseconds  removalInterval_;
 
     std::mutex                                        mutex_;
 
     Window                                            globalEvents_;
-    CooldownState                                     globalCooldown_;
+    std::optional<AlertSeverity>                      globalLastAlertSeverity_;
     std::map<Mac, DeauthSrcMacStats>                  srcMacStats_;
     std::map<Mac, DeauthBssidStats>                   bssidStats_;
     std::optional<TimePoint>                          lastRemovalRun_;

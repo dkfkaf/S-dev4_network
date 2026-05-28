@@ -131,7 +131,7 @@ TEST(Observe, AlertCarriesDeauthFloodPayload) {
     DeauthThresholds thresh;
     thresh.globalRate    = {2, 100, 1000};   // 2번째 deauth에서 global info
     thresh.perSrcMac = {99, 100, 101};   // per-source는 이 테스트에서 사실상 비활성
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();
@@ -143,12 +143,12 @@ TEST(Observe, AlertCarriesDeauthFloodPayload) {
     EXPECT_STREQ(categoryName(alerts[0].payload), "deauth_flood");
 }
 
-TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
+// edge-triggered: 첫 진입 시 1번만 발사. 같은 severity 재도달은 억제.
+TEST(Observe, SameSeverityDoesNotRefire) {
     DeauthThresholds thresh;
     thresh.globalRate    = {3, 100, 1000};      // 3개에서 info
     thresh.perSrcMac = {999, 1000, 1001};   // perSrcMac 잠재 발사 방지
-    const auto cooldown = 5s;
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, cooldown});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();
@@ -158,9 +158,33 @@ TEST(Observe, CooldownSuppressesRepeatedSameSeverity) {
     auto firstFire = det.observe(t0 + 200ms, mkDeauthFrame(attacker));
     EXPECT_EQ(countDeauthAlerts(firstFire, AlertScope::globalRate, AlertSeverity::info), 1);
 
-    // 같은 severity가 cooldown 안에 다시 임계 충족 — 억제되어야 함
+    // 같은 info 단계가 계속 유지 — 추가 발사 없음
     auto suppressed = det.observe(t0 + 500ms, mkDeauthFrame(attacker));
     EXPECT_EQ(countDeauthAlerts(suppressed, AlertScope::globalRate, AlertSeverity::info), 0);
+}
+
+// edge-triggered: window 지나서 count가 0으로 떨어지면 lastSeverity 리셋 → 다음 burst 재발사.
+TEST(Observe, RefiresAfterCountDropsBelowThreshold) {
+    DeauthThresholds thresh;
+    thresh.globalRate = {2, 100, 1000};
+    thresh.perSrcMac  = {999, 1000, 1001};
+    thresh.perBssid   = {999, 1000, 1001};
+    DeauthFloodDetector det(DeauthDetectorConfig{1s, thresh});  // 1초 window
+
+    const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
+    const auto t0 = clock_type::now();
+
+    // 1차 burst — info 발사
+    det.observe(t0,         mkDeauthFrame(attacker));
+    auto first = det.observe(t0 + 100ms, mkDeauthFrame(attacker));
+    EXPECT_EQ(countDeauthAlerts(first, AlertScope::globalRate, AlertSeverity::info), 1);
+
+    // window(1s) 한참 지나서 한 발 — count=1, severity=nullopt → 리셋
+    det.observe(t0 + 5s, mkDeauthFrame(attacker));
+
+    // 2차 burst — 리셋됐으니 다시 info 발사돼야 함
+    auto refire = det.observe(t0 + 5s + 100ms, mkDeauthFrame(attacker));
+    EXPECT_EQ(countDeauthAlerts(refire, AlertScope::globalRate, AlertSeverity::info), 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +195,7 @@ TEST(Observe, NormalDisconnectReasonFullyExcludedFromAllScopes) {
     thresh.globalRate = {3, 100, 1000};       // 3개에서 globalRate info — 그런데 정상 disconnect라 트리거 안 돼야 함
     thresh.perSrcMac  = {3, 100, 1000};
     thresh.perBssid   = {3, 100, 1000};
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const Mac target   = macOf("00:11:22:33:44:55");
@@ -193,7 +217,7 @@ TEST(Observe, SuspiciousReasonCountsTowardsPerSource) {
     thresh.globalRate    = {1000, 2000, 3000};
     thresh.perSrcMac = {3, 100, 1000};
     thresh.perBssid  = {1000, 2000, 3000};
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const Mac target   = macOf("00:11:22:33:44:55");
@@ -214,7 +238,7 @@ TEST(Observe, PerBssidAlertCatchesMacRandomizedAttack) {
     thresh.globalRate    = {1000, 2000, 3000};
     thresh.perSrcMac = {1000, 2000, 3000};   // per-source는 트리거 안 되게
     thresh.perBssid  = {3, 100, 1000};        // 3개에서 info
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac target = macOf("00:11:22:33:44:55");
     const auto t0 = clock_type::now();
@@ -234,11 +258,12 @@ TEST(Observe, PerBssidAlertCatchesMacRandomizedAttack) {
     EXPECT_EQ(countDeauthAlerts(alerts, AlertScope::perBssid,  AlertSeverity::info), 1);
 }
 
-TEST(Observe, EscalationBypassesCooldown) {
+// edge-triggered: info → warn 상승 시 추가 alert 발사.
+TEST(Observe, UpwardSeverityTransitionFires) {
     DeauthThresholds thresh;
-    thresh.globalRate    = {3, 5, 100};          // info=3, warn=5 — escalation 가능
+    thresh.globalRate    = {3, 5, 100};          // info=3, warn=5
     thresh.perSrcMac = {999, 1000, 1001};
-    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh, 5s});
+    DeauthFloodDetector det(DeauthDetectorConfig{10s, thresh});
 
     const Mac attacker = macOf("AA:BB:CC:DD:EE:01");
     const auto t0 = clock_type::now();
@@ -249,7 +274,7 @@ TEST(Observe, EscalationBypassesCooldown) {
     auto fireInfo = det.observe(t0 + 100ms, mkDeauthFrame(attacker));
     EXPECT_EQ(countDeauthAlerts(fireInfo, AlertScope::globalRate, AlertSeverity::info), 1);
 
-    // 4, 5번째 — count=5에서 warn. 직전 alert로부터 0.3초 → cooldown 안. 그러나 escalation이라 발사.
+    // 4, 5번째 — count=5에서 warn으로 상승. edge-triggered가 발사함.
     det.observe(t0 + 200ms, mkDeauthFrame(attacker));
     auto fireWarn = det.observe(t0 + 300ms, mkDeauthFrame(attacker));
     EXPECT_EQ(countDeauthAlerts(fireWarn, AlertScope::globalRate, AlertSeverity::warn), 1);

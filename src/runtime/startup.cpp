@@ -1,13 +1,14 @@
-/* startup.cpp — 프로세스 시작 시 잡일.
-   CLI 사용법 출력(print_usage), --channels CSV 파싱(parse_channel_list),
-   root 권한 + iw 명령 가용성 사전 진단(run_startup_diagnostics).
-   파일 내부 헬퍼(valid_channel_set, exec_silent)는 anonymous namespace로 격리. */
+/* startup.cpp — 프로세스 시작 시 잡일 모음.
+   - CLI: print_usage, parse_channel_list, parse_cli
+   - 진단: run_startup_diagnostics (root + iw 가용성)
+   - iw capability 조회: querySupportedChannels, parseChannelsFromIwPhyInfo
+   - 어댑터 셋업: build_adapters (capability 필터 포함)
+   - 배너: print_banner
+   외부 명령 호출은 run_subprocess(subprocess.cpp)에 위임 — fork/exec/pipe 직접 X. */
 
 #include "pch.h"
 #include "startup.h"
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <cerrno>
+#include "subprocess.h"
 #include <algorithm>
 #include <unordered_set>
 
@@ -26,44 +27,11 @@ const std::vector<int>& valid_channel_set() {
 
 // `iw <args>` 실행해서 stdout 캡처. 실패면 빈 문자열.
 std::string captureIwStdout(std::initializer_list<const char*> args) {
-    int pipefd[2] = {-1, -1};
-    if (::pipe(pipefd) != 0) return "";
-
-    pid_t pid = ::fork();
-    if (pid < 0) { ::close(pipefd[0]); ::close(pipefd[1]); return ""; }
-    if (pid == 0) {
-        ::close(pipefd[0]);
-        ::dup2(pipefd[1], STDOUT_FILENO);
-        int devnull = ::open("/dev/null", O_WRONLY);
-        if (devnull >= 0) { ::dup2(devnull, STDERR_FILENO); ::close(devnull); }
-        ::close(pipefd[1]);
-
-        std::vector<const char*> argv;
-        argv.reserve(args.size() + 2);
-        argv.push_back("iw");
-        for (const char* a : args) argv.push_back(a);
-        argv.push_back(nullptr);
-        ::execvp("iw", const_cast<char* const*>(argv.data()));
-        ::_exit(127);
-    }
-
-    ::close(pipefd[1]);
-    std::string out;
-    char buf[512];
-    for (;;) {
-        ssize_t n = ::read(pipefd[0], buf, sizeof(buf));
-        if (n > 0)      out.append(buf, n);
-        else if (n == 0) break;
-        else if (errno != EINTR) break;
-    }
-    ::close(pipefd[0]);
-
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return "";
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return "";
-    return out;
+    std::vector<std::string> argv = {"iw"};
+    for (const char* a : args) argv.emplace_back(a);
+    SubprocessOpts opts; opts.captureStdout = true;
+    auto r = run_subprocess(argv, opts);
+    return r.succeeded() ? r.stdoutText : "";
 }
 
 // `iw dev <iface> info` 출력에서 "wiphy N" 라인의 N 추출.
@@ -85,28 +53,9 @@ std::string findWiphyIndex(const std::string& iface) {
 }
 
 bool exec_silent(const char* prog, std::initializer_list<const char*> args) {
-    pid_t pid = ::fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        int devnull = ::open("/dev/null", O_WRONLY);
-        if (devnull >= 0) {
-            ::dup2(devnull, STDOUT_FILENO);
-            ::dup2(devnull, STDERR_FILENO);
-            ::close(devnull);
-        }
-        std::vector<const char*> argv;
-        argv.reserve(args.size() + 2);
-        argv.push_back(prog);
-        for (const char* a : args) argv.push_back(a);
-        argv.push_back(nullptr);
-        ::execvp(prog, const_cast<char* const*>(argv.data()));
-        ::_exit(127);
-    }
-    int status = 0;
-    while (::waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
-    }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    std::vector<std::string> argv = {prog};
+    for (const char* a : args) argv.emplace_back(a);
+    return run_subprocess(argv).succeeded();   // 캡처 옵션 모두 false → /dev/null
 }
 
 }  // namespace
@@ -197,3 +146,132 @@ std::vector<int> querySupportedChannels(const std::string& iface) {
     return channels;
 }
 
+// ─── CLI/어댑터 셋업 ─────────────────────────────────────────────────────────
+
+CliOpts parse_cli(int argc, char* argv[]) {
+    CliOpts opts;
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
+            print_usage();
+            opts.showHelpAndExit = true;
+            return opts;
+        }
+        if (std::strcmp(a, "--band") == 0 && i + 1 < argc) {
+            const char* v = argv[++i];
+            if      (std::strcmp(v, "2g")  == 0) opts.band = CliOpts::Band::twoFour;
+            else if (std::strcmp(v, "5g")  == 0) opts.band = CliOpts::Band::five;
+            else if (std::strcmp(v, "all") == 0) opts.band = CliOpts::Band::all;
+            else {
+                std::cerr << "[init] 알 수 없는 --band 값: " << v << "\n";
+                print_usage();
+                opts.parseOk = false;
+                return opts;
+            }
+        } else if (std::strcmp(a, "--channels") == 0 && i + 1 < argc) {
+            if (!parse_channel_list(argv[++i], opts.customChannels)) {
+                LOG(ERROR) << "[init] --channels 파싱 실패: " << argv[i];
+                opts.parseOk = false;
+                return opts;
+            }
+        } else if (a[0] == '-') {
+            std::cerr << "[init] 알 수 없는 옵션: " << a << "\n";
+            print_usage();
+            opts.parseOk = false;
+            return opts;
+        } else {
+            opts.positionalIfnames.emplace_back(a);
+        }
+    }
+    return opts;
+}
+
+namespace {
+
+// CliOpts → 기본 ChannelHopConfig (capability 필터 전).
+ChannelHopConfig pickConfigForSingle(const CliOpts& opts) {
+    if (!opts.customChannels.empty()) {
+        ChannelHopConfig c;
+        c.channels = opts.customChannels;
+        c.dwell    = std::chrono::milliseconds(500);
+        return c;
+    }
+    switch (opts.band) {
+        case CliOpts::Band::twoFour: return ChannelHopConfig::twoFourOnly();
+        case CliOpts::Band::five:    return ChannelHopConfig::fastNonDfs();
+        case CliOpts::Band::all:
+        default:                     return ChannelHopConfig{};
+    }
+}
+
+// 한 어댑터의 채널 목록을 그 어댑터가 실제 지원하는 것만으로 필터.
+// 전부 미지원이면 false 반환 (호출자가 종료 판단).
+bool applyCapabilityFilter(AdapterSetup& a) {
+    auto supported = querySupportedChannels(a.ifname);
+    if (supported.empty()) return true;  // 조회 실패 — fallback으로 config 그대로 사용
+
+    std::unordered_set<int> supportedSet(supported.begin(), supported.end());
+    std::vector<int> filtered;
+    for (int ch : a.config.channels) {
+        if (supportedSet.count(ch)) filtered.push_back(ch);
+    }
+    const size_t before = a.config.channels.size();
+    if (filtered.size() != before) {
+        LOG(INFO) << "[init] iface=" << a.ifname
+                  << " 지원 채널 자동 필터: " << before << "개 → " << filtered.size() << "개"
+                  << " (어댑터 미지원 " << (before - filtered.size()) << "개 제외)";
+    }
+    if (filtered.empty()) {
+        LOG(ERROR) << "[init] iface=" << a.ifname << " 설정 채널 전부 미지원 — 종료";
+        return false;
+    }
+    a.config.channels = std::move(filtered);
+    return true;
+}
+
+}  // namespace
+
+std::vector<AdapterSetup> build_adapters(const CliOpts& opts) {
+    std::vector<AdapterSetup> adapters;
+    const auto& pos = opts.positionalIfnames;
+
+    if (pos.size() == 1) {
+        adapters.push_back({pos[0], "", pickConfigForSingle(opts)});
+    } else if (pos.size() == 2) {
+        if (pos[0] == pos[1]) {
+            LOG(ERROR) << "[init] fast-iface와 dfs-iface는 달라야 합니다: " << pos[0];
+            return {};
+        }
+        adapters.push_back({pos[0], "fast", ChannelHopConfig::fastNonDfs()});
+        adapters.push_back({pos[1], "dfs",  ChannelHopConfig::dfsOnly()});
+    } else {
+        print_usage();
+        return {};
+    }
+
+    for (auto& a : adapters) {
+        if (!applyCapabilityFilter(a)) return {};
+        LOG(INFO) << "[init] 어댑터: " << a.ifname
+                  << " | 채널 목록: " << a.config.channels.size() << "개";
+    }
+    return adapters;
+}
+
+void print_banner(const std::vector<AdapterSetup>&                    adapters,
+                  const std::vector<std::unique_ptr<ChannelHopper>>&  hoppers,
+                  const std::vector<std::string>&                     detectorPolicyLines) {
+    std::cout << "[*] mode          : "
+              << (adapters.size() == 1 ? "single-adapter" : "dual-adapter") << "\n";
+    for (size_t i = 0; i < adapters.size(); ++i) {
+        std::cout << "[*] ";
+        if (!adapters[i].label.empty()) std::cout << adapters[i].label << "-iface : ";
+        else                            std::cout << "interface     : ";
+        std::cout << adapters[i].ifname << " — " << hoppers[i]->summary() << "\n";
+    }
+    for (size_t i = 0; i < detectorPolicyLines.size(); ++i) {
+        std::cout << (i == 0 ? "[*] deauth policy : " : "[*]                 ")
+                  << detectorPolicyLines[i] << "\n";
+    }
+    std::cout << "[*]                 정상 disconnect(reason 3/8)는 모든 카운터에서 완전 제외 (alert 없음)\n"
+              << "[*] 802.11 management frame 캡처 시작 ... (Ctrl+C to stop)\n";
+}

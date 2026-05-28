@@ -10,6 +10,7 @@
 // 헤더 전역 변수 회피 — function-local static으로 같은 효과 (C++17 magic statics가 thread-safe init 보장).
 inline std::mutex& outputMutex() { static std::mutex m; return m; }
 
+
 inline void print_frame(const char* label, const ParsedFrame& f) {
     std::lock_guard<std::mutex> lock(outputMutex());
     if (label) std::cout << "[" << label << "]";
