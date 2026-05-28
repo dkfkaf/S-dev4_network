@@ -6,9 +6,11 @@
    stdout/stderr 캡처 옵션, 안 한 stream은 /dev/null로 redirect. 캡처 상한으로 OOM 방지. */
 
 struct SubprocessResult {
-    bool        spawned  = false;   // fork() 자체 성공 여부
-    bool        exited   = false;   // WIFEXITED — false면 시그널/비정상 종료
-    int         exitCode = -1;      // WEXITSTATUS — exited=true일 때만 의미
+    bool        spawned   = false;   // fork() 자체 성공 여부
+    bool        exited    = false;   // WIFEXITED — 정상 종료
+    bool        signaled  = false;   // WIFSIGNALED — 시그널로 종료
+    int         exitCode  = -1;      // WEXITSTATUS — exited=true일 때만 의미
+    int         signalNum = 0;       // WTERMSIG — signaled=true일 때만 의미
     std::string stdoutText;
     std::string stderrText;
 

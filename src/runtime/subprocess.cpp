@@ -22,11 +22,15 @@ void closePipe(int (&p)[2]) {
 }
 
 // 자식 측: capture 요청된 stream은 pipe write end로, 아니면 /dev/null로 redirect.
+// 둘 다 없으면(fd 고갈 등 극단 케이스) 그냥 닫음 — 자식의 write가 EBADF로 실패하지만
+// 부모 콘솔로 출력 새어나가는 것보단 나음.
 void redirectStdStream(int targetFd, int pipeWriteEnd, int devnull) {
     if (pipeWriteEnd >= 0) {
         ::dup2(pipeWriteEnd, targetFd);
     } else if (devnull >= 0) {
         ::dup2(devnull, targetFd);
+    } else {
+        ::close(targetFd);
     }
 }
 
@@ -121,6 +125,9 @@ SubprocessResult run_subprocess(const std::vector<std::string>& argv,
     if (WIFEXITED(status)) {
         result.exited   = true;
         result.exitCode = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        result.signaled  = true;
+        result.signalNum = WTERMSIG(status);
     }
     return result;
 }

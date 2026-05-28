@@ -116,9 +116,9 @@ std::vector<int> parseChannelsFromIwPhyInfo(const std::string& iwOutput) {
     while (std::getline(iss, line)) {
         // 규제로 막힌 채널은 "disabled" 마킹됨 — 제외.
         if (line.find("disabled") != std::string::npos) continue;
-        // "    * 2412 MHz [1] (20.0 dBm)" 같은 형식 파싱
-        int freq, ch;
-        if (std::sscanf(line.c_str(), " * %d MHz [%d]", &freq, &ch) == 2) {
+        // "    * 2412 MHz [1] (20.0 dBm)" 같은 형식 파싱. MHz는 매칭만 하고 버림(%*d).
+        int ch;
+        if (std::sscanf(line.c_str(), " * %*d MHz [%d]", &ch) == 1) {
             channels.push_back(ch);
         }
     }
